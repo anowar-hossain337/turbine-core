@@ -1,0 +1,112 @@
+DomainSetup
+{
+    //domainSize    < 400, 200, 200>;
+    domainSize    < 200, 100, 64>;   
+}
+
+Parameters
+{
+    initialVelocity < 0.05773502691896259, 0, 0 >;
+    timesteps              25000; //2009178.9367798967;
+
+    length_SI              27.0;
+    length_LU              5;
+
+    velocity_SI            8.7;
+    velocity_LU            0.05773502691896259;
+
+    viscosity_SI           1.82e-05;
+    density_SI             1.225;
+
+    gaussianSigma     2.0;
+
+   useGui 0;
+    remainingTimeLoggerFrequency 5; // in seconds
+
+    innerOuterSplit < 8, 1, 1>;     // slice-thickness that 'outer'-kernels process when overlapping
+    gpuBlockSize < 64, 1, 1>;
+
+    roughnessLengthRatio 0.0005185185185185185;  // 0.014 / referenceHeight_LU / C_l
+    referenceHeight_LU 5;
+    kappa 0.42;
+}
+
+Boundaries
+{
+    setup                   Open;
+
+    inflowType              Periodic;
+    outflowType             Periodic;
+
+    //inflowType              Inflow;
+    //outflowType             Outflow;
+
+    inflowVelocity          <0.05773502691896259, 0, 0>;
+    outflowPressure         1.0;
+
+    wallType WFB;
+}
+
+WindFarm{
+	Turbine1
+	{
+	    basePoint             <50,50,0.0>;
+	    diameter_LU             25;
+	    hubRotationalVelocity       <0,0,1.074994905410475>;
+	    towerDescription   nrel_5mw.tower;
+	    bladeDescription   nrel_5mw.blade;
+	    towerEffect     0;
+	    nacelleEffect   0;
+	    tipLoss         0;
+	    nPointsBlades   50;
+	    nPointsTower    20;
+	    nBlades         3.0;
+	    nacelleYaw      0.0;
+	    hubRadius_SI    1.5;
+	    hubDeport_SI    0.0;
+	    hubTilt         0.0;
+	    bladePitch      0.0;
+	    bladePrecone    0.0;
+	    aeroModel       rotorDisk;
+	    rotorDrag       1.1055728090000843;
+	}
+}
+
+Output{
+    VTK
+    {
+        writeFrequency 500;
+        ghostLayers    0;
+
+        baseFolder           vtk_out_D25;
+        executionFolder      simulation_step;
+
+        inclusion_filters {
+            Plane {
+                point <0,50,0>;
+                normal <0,1,0>;
+                maxDistance 1;
+            }
+
+            Plane {
+                point <0,0,6>;
+                normal <0,0,1>;
+                maxDistance 1;
+            }
+        }
+
+        fields {
+            // Density;
+            Velocity;
+            // eddyviscosity;
+            // strain;
+            // Force;
+            // meanVelocity {
+            //    SamplingInterval    500;
+            // }
+        }
+
+        writeFlagField  1;
+        //writeDomainDecomposition;
+    }
+}

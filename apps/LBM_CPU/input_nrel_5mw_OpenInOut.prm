@@ -1,0 +1,235 @@
+DomainSetup
+{
+    domainSize    <64,32,32>;
+    cellsPerBlock <64,32,16>;
+
+    loadSnapshot    0;
+    storeSnapshot   0;
+    snapshotFrequency 250;
+    snapshotBaseFolder snapshot;
+    snapshotConfigFile TurbineSnapshot.config;
+    snapshotBlockforestFile TurbineSnapshot.forest;
+    snapshotPdfFile TurbineSnapshot.pdf;
+    snapshotForceFile TurbineSnapshot.force;
+    snapshotMeanVelFile TurbineSnapshot.mean;
+    snapshotSOSFile TurbineSnapshot.sos;
+    snapshotSOCFile TurbineSnapshot.soc;
+}
+
+Parameters
+{
+    timesteps          2000;
+
+    length_SI             126.0;
+    length_LU              16.0;
+
+    velocity_SI             8.00;
+    velocity_LU             0.05;
+
+    viscosity_SI        1.82e-05;
+    density_SI             1.225;
+
+    remainingTimeLoggerFrequency 5; // in seconds
+
+    referenceHeight_LU   16;
+    samplingHeight_LU    8;
+
+    roughnessLengthRatio 1e-3;
+
+    coriolisFrequency   -1;
+    geostrophicWind <-1, -1, -1>;
+
+    driverType  pressureGradient;
+}
+
+Initialisation {
+    type asmuth; //logLaw; // uniform; // asmuth;
+    initialVelocity <0.05, 0, 0>;
+}
+
+Boundaries
+{
+    setup                   Open;
+
+    inflowType              LogLawInflow;
+    outflowType             Outflow;
+
+    inflowVelocity          <0.05, 0, 0>;
+
+    wallType                NoSlip;
+
+    /*
+        numberElements 20;
+        elementDistance 5;
+        elementLength 10;
+
+        Body
+        {
+            shape box;
+            min <20,0,0>;
+            max <30,48,10>;
+            flag NoSlip Flag;
+        }
+    */
+}
+
+WindFarm{
+
+    outputFolder  TurbineOutput;
+    startingTimeStepForces 2000;
+    frequencyOutputForces 1;
+
+    Turbine1
+    {
+        basePoint             <16, 16, 0>;
+
+        diameter_LU             16.0;
+
+        hubRotationalVelocity       <0,0,0.4>;
+
+        towerDescription   nrel_5mw.tower;
+        bladeDescription   nrel_5mw.blade;
+
+        towerEffect     0;
+        nacelleEffect   0;
+
+        nPointsBlades    80;
+        nPointsTower     20;
+        nBlades         3.0;
+
+        nacelleYaw      0.0;
+
+        hubRadius_SI     1.5;
+        hubDeport_SI     0.0;
+
+        hubTilt         0.0;
+
+        bladePitch      0.0;
+        bladePrecone    0.0;
+
+        tipLoss         0;
+
+        bladeController DISCON_Pitch_Control; //DISCON_Pitch_Control; // None; // DISCON_Pitch_Control; // RAWS_Angles;
+        hubController   DISCON_Torque_Control; //DISCON_Torque_Control; // DISCON_Torque_Control; //DISCON_Torque_Control; //DISCON_Torque_Control; // None; //RAWS_Omega; //None; // RAWS_Omega;
+        towerController None; // timeControlVelocities;
+	nacelleController simple_yaw_controller;
+
+	simpleYawController {
+	    yawingSpeed 0.0001;
+	}
+
+        timeControlVelocities {
+            table towerBaseControl.ctrl;
+        }
+        RAWS_Angles {
+            table pitchRAWSControl.ctrl;
+            initialAngles <0., 0., 0.>;
+            alphaFilter 0.7;
+        }
+        RAWS_Omega {
+            table omegaRAWSControl.ctrl;
+            alphaFilter 0.7;
+        }
+
+        DISCON_Torque_Control {
+            cutinSpeed 70.16223593017205;
+            region_2_startingspeed 91.21090670922365;
+            region_2_endingspeed 121.68048081810522;
+            rated_generator_speed 122.90957658394467;
+
+            cutin_torque 0.0;
+            rated_generator_torque 43093.55;
+
+            rotor_radius 63.0;
+            Ngear 97.0;  // Gearbox ratio
+            rated_power 5296610.0;
+            Cp_opt 0.482;
+            tsrOpt 7.55;
+            Irot 35400000.0; //38759228.0;  // Rotor inertia
+            Igen 534.116; // Generator inertia
+            gearboxEfficiency 0.96;
+            generatorEfficiency 0.944;
+        }
+
+        DISCON_Pitch_Control {
+            pitchK 0.11;
+            pitchControlKP 0.01882681;
+            pitchControlKI 0.008068634;
+            pitchMin 0;
+            pitchMax 1.5707963267948966;
+            maxPitchRate 0.13962634015954636;
+
+            ratedGeneratorSpeed 122.90957658394467;
+            nGear 97;
+        }
+
+	    aeroModel       actuatorLine; //rotorDisk;
+	    // rotorDrag       1.1055728090000843;
+    }
+}
+
+StabilityChecker
+{
+    checkFrequency 100;
+    streamOutput   false;
+    vtkOutput      true;
+}
+
+Output
+{
+
+    welfordIntervalOutput 1000;
+
+    VTK
+    {
+        writeFrequency 1000;
+        ghostLayers    0;
+
+        baseFolder           vtk_out;
+        executionFolder      simulation_step;
+
+        inclusion_filters {
+            Plane {
+                point <0,16,0>;
+                normal <0,1,0>;
+                maxDistance 1;
+            }
+            Plane {
+                point <16,0,0>;
+                normal <1,0,0>;
+                maxDistance 1;
+            }
+            Plane {
+                point <16,0,16>;
+                normal <0,0,1>;
+                maxDistance 1;
+            }
+        }
+
+        fields {
+            // Density;
+            Velocity;
+            // meanVelocity;
+            // sumofproducts;
+            Force;
+        }
+
+        // writeFlagField  4;
+        writeDomainDecomposition;
+    }
+
+    LineOutput {
+        Line {
+            start   < 127, 16, 0>;
+            end     < 127, 16, 32>;
+            resolution 32;
+        }
+
+        Fields {
+            velocity;
+        }
+
+        outputFrequency     1;
+        startingTimeStep    2000;
+    }
+}

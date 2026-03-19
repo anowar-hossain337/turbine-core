@@ -1,0 +1,67 @@
+
+waLBerla_link_files_to_builddir( *.prm )
+waLBerla_link_files_to_builddir( airfoil_data )
+waLBerla_link_files_to_builddir( *.blade )
+waLBerla_link_files_to_builddir( *.tower )
+waLBerla_link_files_to_builddir( *.ctrl )
+waLBerla_link_files_to_builddir( *.wd )
+
+waLBerla_generate_target_from_python(
+        NAME TurbineApp_{{target.name.lower()}}_{{grid.name.lower()}}_Generation
+        FILE LBMGeneration.py
+        OUT_FILES
+        waLBerlaWind_KernelInfo.h
+        waLBerlaWind_SweepCollection.{{source_extension}} waLBerlaWind_SweepCollection.h
+        waLBerlaWind_StorageSpecification.{{source_extension}} waLBerlaWind_StorageSpecification.h
+        waLBerlaWind_BoundaryCollection.h
+        waLBerlaWind_NoSlip.{{source_extension}} waLBerlaWind_NoSlip.h
+        waLBerlaWind_FreeSlip.{{source_extension}} waLBerlaWind_FreeSlip.h
+        {% if generate_wfb -%}
+        waLBerlaWind_WFB.{{source_extension}} waLBerlaWind_WFB.h
+        {% endif -%}
+        waLBerlaWind_UniformUBB.{{source_extension}} waLBerlaWind_UniformUBB.h
+        waLBerlaWind_LogLawUBB.{{source_extension}} waLBerlaWind_LogLawUBB.h
+        waLBerlaWind_Outflow.{{source_extension}} waLBerlaWind_Outflow.h
+        {% if generate_wfb -%}
+        waLBerlaWind_{{welford_wfb_name}}.{{source_extension}} waLBerlaWind_{{welford_wfb_name}}.h
+        {%- endif %}
+        {% if vtk_output -%}
+        waLBerlaWind_{{welford_output_name}}.{{source_extension}} waLBerlaWind_{{welford_output_name}}.h
+        {% if Fields.SUM_OF_SQUARES in field_map -%}
+        waLBerlaWind_SoSResetter.{{source_extension}} waLBerlaWind_SoSResetter.h
+        {%- endif %}
+        {% if Fields.SUM_OF_CUBES in field_map -%}
+        waLBerlaWind_SoCResetter.{{source_extension}} waLBerlaWind_SoCResetter.h
+        {%- endif %}
+        {% if Fields.MEAN_EDDY_VISCOSITY in field_map -%}
+        waLBerlaWind_{{welford_eddy_viscosity_name}}.{{source_extension}} waLBerlaWind_{{welford_eddy_viscosity_name}}.h
+        {%- endif %}
+        {% endif -%}
+        waLBerlaWind_PdfSetter.cpp waLBerlaWind_PdfSetter.h
+        {% if streaming_pattern.is_inplace() -%}
+        waLBerlaWind_MacroGetter_EVEN.cpp waLBerlaWind_MacroGetter_EVEN.h
+        waLBerlaWind_MacroGetter_ODD.cpp waLBerlaWind_MacroGetter_ODD.h
+        {%- else -%}
+        waLBerlaWind_MacroGetter.cpp waLBerlaWind_MacroGetter.h
+        {%- endif %}
+        {% if vtk_output and Fields.STRAIN_RATE in field_map -%}
+        waLBerlaWind_StrainRateWriter.{{source_extension}} waLBerlaWind_StrainRateWriter.h
+        {% if Fields.MEAN_STRAIN_RATE in field_map -%}
+        waLBerlaWind_{{welford_strain_rate_name}}.{{source_extension}} waLBerlaWind_{{welford_strain_rate_name}}.h
+        {%- endif %}
+        {% endif -%}
+        FlowDriverCollection.h
+        Drivers.h Drivers.{{source_extension}}
+)
+
+waLBerla_add_executable(
+
+        NAME TurbineApp_{{target.name.lower()}}_{{grid.name.lower()}}
+        FILES main.{{source_extension}}
+        DEPENDS walberla::core walberla::blockforest walberla::domain_decomposition walberla::field walberla::lbm
+                walberla::timeloop {% if target == Target.GPU %}walberla::gpu{% endif %}
+                TurbineApp_{{target.name.lower()}}_{{grid.name.lower()}}_Generation
+                domain component turbine_topology force_model
+                wind_turbine_core
+
+)

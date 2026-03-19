@@ -1,0 +1,7 @@
+//   alpha   C_l    C_d
+// Npoints, aoa min, aoa max for discretisation
+3 -180. 180.
+
+-180.00 0.000 0.3500
+0.00 0.000 0.3500
+180.00 0.000 0.3500

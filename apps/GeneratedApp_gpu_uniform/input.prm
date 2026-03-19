@@ -1,0 +1,204 @@
+DomainSetup
+{
+    domainSize    <128,32,32>;
+    // cellsPerBlock <16, 16, 16>;
+
+    loadSnapshot    0;
+    storeSnapshot   0;
+    snapshotFrequency 250;
+    snapshotBaseFolder snapshot;
+    snapshotConfigFile TurbineSnapshot.config;
+    snapshotBlockforestFile TurbineSnapshot.forest;
+    snapshotPdfFile TurbineSnapshot.pdf;
+    snapshotForceFile TurbineSnapshot.force;
+    snapshotMeanVelFile TurbineSnapshot.mean;
+    snapshotSOPFile TurbineSnapshot.sop;
+}
+
+Parameters
+{
+    timesteps          20000;
+
+    length_SI             126.0;
+    length_LU              16.0;
+
+    velocity_SI            10.0;
+    velocity_LU             0.05;
+
+    viscosity_SI           1.82e-05;
+    density_SI             1.22;
+
+    remainingTimeLoggerFrequency 5; // in seconds
+
+    roughnessLengthRatio 1e-3;
+    referenceHeight_LU   16;
+    samplingHeight_LU    8;
+
+    driverType          pressureGradient;
+    coriolisFrequency   -1; // given in s^-1; here: dummy value
+    geostrophicWind     <-100, -100, -100>; // given in m*s^-1, the third component should ALWAYS be 0; here: dummy value
+    windDirectionDegrees 0;
+    windDirectionChangeRateTable "windDirectionChange.wd";
+}
+
+Initialisation {
+    type asmuth; //logLaw; // uniform;
+    initialVelocity <0.05, 0, 0>;
+}
+
+Boundaries
+{
+    setup                   Open;
+
+    inflowType              Periodic;
+    outflowType             Periodic;
+
+    inflowVelocity          <0.05, 0, 0>;
+    outflowPressure         1.0;
+
+    wallType                WFB;
+    /*
+        numberElements 20;
+        elementDistance 5;
+        elementLength 10;
+
+        Body
+        {
+            shape box;
+            min <20,0,0>;
+            max <30,48,10>;
+            flag NoSlip Flag;
+        }
+    */
+}
+
+WindFarm{
+
+    outputFolder  TurbineOutput;
+    startingTimeStepForces 2000;
+    frequencyOutputForces 1;
+
+    Turbine1
+    {
+        basePoint             <64, 16, 0>;
+
+        diameter_LU             16.0;
+
+        hubRotationalVelocity       <0,0,1.2>;
+
+        towerDescription   nrel_5mw.tower;
+        bladeDescription   nrel_5mw.blade;
+
+        towerEffect     0;
+        nacelleEffect   0;
+
+        nPointsBlades   30;
+        nPointsTower    20;
+        nBlades         3.0;
+
+        nacelleYaw      0.0;
+
+        hubRadius_SI     1.5;
+        hubDeport_SI    10.0;
+
+        hubTilt         0.0;
+
+        bladePitch      0.0;
+        bladePrecone    0.0;
+
+        tipLoss         0;
+
+        bladeController None; //None; // RAWS_Angles;
+        hubController   None; //RAWS_Omega; //None; // RAWS_Omega;
+        towerController None; //timeControlVelocities;
+
+        timeControlVelocities {
+            table towerBaseControl.ctrl;
+        }
+        RAWS_Angles {
+            table pitchRAWSControl.ctrl;
+            initialAngles <0., 0., 0.>;
+            alphaFilter 0.7;
+        }
+        RAWS_Omega {
+            table omegaRAWSControl.ctrl;
+            alphaFilter 0.7;
+        }
+
+	    aeroModel       actuatorLine; //rotorDisk;
+	    // rotorDrag       1.1055728090000843;
+    }
+}
+
+StabilityChecker
+{
+    checkFrequency 100;
+    streamOutput   false;
+    vtkOutput      true;
+}
+
+Output
+{
+    welfordInterval 100;
+    VTK
+    {
+        writeFrequency 100;
+        ghostLayers    0;
+
+        baseFolder           vtk_out;
+        executionFolder      simulation_step;
+
+/*
+        inclusion_filters {
+            Plane {
+                point <0,16,0>;
+                normal <0,1,0>;
+                maxDistance 1;
+            }
+            Plane {
+                point <64,0,0>;
+                normal <1,0,0>;
+                maxDistance 1;
+            }
+            AABB {
+                min < 0,  0,  0>;
+                max <10, 10, 10>;
+            }
+        }
+*/
+
+        fields {
+            Density;
+            EddyViscosity;
+            Force;
+            MeanEddyViscosity;
+            MeanStrainRate;
+            MeanVelocityOutput;
+            Omega;
+            StrainRate;
+            SumOfCubes;
+            SumOfSquares;
+            Velocity;
+        }
+
+        writeFlagField 1;
+        writeDomainDecomposition;
+    }
+
+    /*
+    LineOutput {
+        Line {
+            start   < 127, 16, 0>;
+            end     < 127, 16, 32>;
+            resolution 32;
+        }
+
+        Fields {
+            velocity;
+        }
+
+        outputFrequency     1;
+        startingTimeStep    2000;
+    }
+    */
+}

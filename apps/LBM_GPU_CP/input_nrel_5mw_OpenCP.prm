@@ -1,0 +1,208 @@
+DomainSetup
+{
+    domainSize    <98,32,32>;
+
+    loadSnapshot    0;
+    storeSnapshot   0;
+    snapshotFrequency 250;
+    snapshotBaseFolder snapshot;
+    snapshotConfigFile TurbineSnapshot.config;
+    snapshotBlockforestFile TurbineSnapshot.forest;
+    snapshotPdfFile TurbineSnapshot.pdf;
+    snapshotForceFile TurbineSnapshot.force;
+    snapshotMeanVelFile TurbineSnapshot.mean;
+    snapshotSOPFile TurbineSnapshot.sop;
+}
+
+Parameters
+{
+    timesteps          5000;
+    concurrentStart    1000;
+
+    length_SI             126.0;
+    length_LU              16.0;
+
+    velocity_SI            10.0;
+    velocity_LU             0.05;
+
+    viscosity_SI           1.82e-05;
+    density_SI             1.22;
+
+    remainingTimeLoggerFrequency 5; // in seconds
+
+    referenceHeight_LU  16;
+    samplingHeight_LU 8;
+
+    roughnessLengthRatio 1e-3;
+
+    coriolisFrequency   -1;
+    geostrophicWind <-1, -1, -1>;
+
+    driverType  pressureGradient;
+}
+
+Initialisation {
+    type asmuth;
+    initialVelocity <0.05, 0, 0>;
+}
+
+PrecursorBoundaries
+{
+    setup                   Open;
+    wallType                NoSlip;
+    inflowType              ShiftedPeriodic;
+    outflowType             ShiftedPeriodic;
+}
+
+ConcurrentBoundaries
+{
+    setup                   Open;
+    wallType                NoSlip;    
+
+    inflowType              UniformInflow;
+    outflowType             Outflow;
+
+    inflowVelocity          <0.05, 0, 0>;
+    outflowPressure         1.0;
+}
+
+WindFarm{
+
+    outputFolder  TurbineOutput;
+    startingTimeStepForces 2000;
+    frequencyOutputForces 1;
+
+    Turbine1
+    {
+        basePoint             <24, 16, 0>;
+
+        diameter_LU             16.0;
+
+        hubRotationalVelocity       <0,0,1.2>;
+
+        towerDescription   nrel_5mw.tower;
+        bladeDescription   nrel_5mw.blade;
+
+        towerEffect     0;
+        nacelleEffect   0;
+
+        nPointsBlades   30;
+        nPointsTower    20;
+        nBlades         3.0;
+
+        nacelleYaw      0.0;
+
+        hubRadius_SI     1.5;
+        hubDeport_SI    10.0;
+
+        hubTilt         0.0;
+
+        bladePitch      0.0;
+        bladePrecone    0.0;
+
+        tipLoss         1;
+
+        bladeController None; //None; // RAWS_Angles;
+        hubController   None; //RAWS_Omega; //None; // RAWS_Omega;
+        towerController None; //time_control_velocities
+
+        timeControlVelocities {
+            table towerBaseControl.ctrl;
+        }
+        RAWS_Angles {
+            table pitchRAWSControl.ctrl;
+            initialAngles <0., 0., 0.>;
+            alphaFilter 0.7;
+        }
+        RAWS_Omega {
+            table omegaRAWSControl.ctrl;
+            alphaFilter 0.7;
+        }
+
+	    aeroModel       actuatorLine;
+	    rotorDrag       1.1055728090000843;
+    }
+}
+
+StabilityChecker
+{
+    checkFrequency 100;
+    streamOutput   false;
+    vtkOutput      true;
+}
+
+PrecursorOutput
+{
+
+    welfordIntervalOutput 250;
+
+    VTK
+    {
+        writeFrequency 250;
+        ghostLayers    0;
+
+        baseFolder           Precursor_vtk_out;
+        executionFolder      simulation_step;
+
+        inclusion_filters {
+            Plane {
+                point <0,16,0>;
+                normal <0,1,0>;
+                maxDistance 1;
+            }
+            Plane {
+                point <48,0,0>;
+                normal <1,0,0>;
+                maxDistance 1;
+            }
+        }
+
+        fields {
+            // Density;
+            Velocity;
+            Force;
+        }
+
+        // writeFlagField  4;
+        writeDomainDecomposition;
+    }
+}
+
+ConcurrentOutput
+{
+
+    welfordIntervalOutput 25;
+
+    VTK
+    {
+        writeFrequency 25;
+        ghostLayers    0;
+
+        baseFolder           Concurrent_vtk_out;
+        executionFolder      simulation_step;
+
+        inclusion_filters {
+            Plane {
+                point <0,16,0>;
+                normal <0,1,0>;
+                maxDistance 1;
+            }
+            Plane {
+                point <48,0,0>;
+                normal <1,0,0>;
+                maxDistance 1;
+            }
+        }
+
+        fields {
+            // Density;
+            Velocity;
+            meanVelocity;
+            sumofsquares;
+            Force;
+        }
+
+        // writeFlagField  4;
+        writeDomainDecomposition;
+    }
+}
