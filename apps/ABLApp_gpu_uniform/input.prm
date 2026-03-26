@@ -1,0 +1,112 @@
+DomainSetup
+{
+    domainSize    <192, 192, 128>;
+    cellsPerBlock <16, 16, 16>;
+
+    loadSnapshot    0;
+    storeSnapshot   0;
+    snapshotFrequency 250;
+    snapshotBaseFolder snapshot;
+    snapshotConfigFile TurbineSnapshot.config;
+    snapshotBlockforestFile TurbineSnapshot.forest;
+    snapshotPdfFile TurbineSnapshot.pdf;
+    snapshotForceFile TurbineSnapshot.force;
+    snapshotMeanVelFile TurbineSnapshot.mean;
+    snapshotSOPFile TurbineSnapshot.sop;
+}
+
+Parameters
+{
+    timesteps          3000;
+
+    length_SI             160;
+    length_LU              16.0;
+
+    velocity_SI            5;
+    velocity_LU             0.05;
+
+    viscosity_SI           0.0000189;
+    density_SI             1;
+
+    remainingTimeLoggerFrequency 5; // in seconds
+
+    roughnessLengthRatio 0.000625;
+    referenceHeight_LU   16;
+    samplingHeight_LU    8;
+
+    driverType          pressureGradient; //none, pressureGradient, dynamicPressureGradient, coriolisForce
+    coriolisFrequency   0.0001; // given in s^-1; Only applicable if drivertype is coriolisForce
+    geostrophicWind     <10, 0, 0>; // given in m*s^-1, the third component should ALWAYS be 0; Only applicable if drivertype is coriolisForce
+    windDirectionDegrees 0; // Only applicable if drivertype is pressureGradient
+    windDirectionChangeRateTable "windDirectionChange.wd"; // Only applicable if drivertype is dynamicPressureGradient
+
+    cudaEnabledMPI false;
+}
+
+Initialisation {
+    type asmuth; // logLaw; // uniform;
+    initialVelocity <0.075, 0, 0>; //Used to calculate friction velocity
+}
+
+Boundaries
+{
+    setup                   Open;
+
+    inflowType              logLawInflow; // periodic, shiftedPeriodic, logLawInflow, uniformInflow
+    outflowType             Outflow;
+
+    inflowVelocity          <0.05, 0, 0>; // Only applicable if inflowType is set uniformInflow
+    outflowPressure         1.0; //not used in this application
+
+    wallType                WFB;
+
+    numberElements 0;
+    elementDistance 0;
+    elementLength 0;
+
+    Body
+    {
+        shape box;
+        min <38, 86, 0>;
+        max <58, 106, 20>;
+        flag NoSlip Flag;
+
+    }
+}
+
+StabilityChecker
+{
+    checkFrequency 100;
+    streamOutput   false;
+    vtkOutput      true;
+}
+
+Output
+{
+    welfordInterval 100;
+    VTK
+    {
+        writeFrequency 100;
+        ghostLayers    0;
+
+        baseFolder           vtk_out;
+        executionFolder      simulation_step;
+
+        fields {
+            Density;
+            EddyViscosity;
+            Force;
+            MeanEddyViscosity;
+            MeanStrainRate;
+            MeanVelocityOutput;
+            Omega;
+            StrainRate;
+            SumOfCubes;
+            SumOfSquares;
+            Velocity;
+        }
+
+        writeFlagField 4;
+        writeDomainDecomposition;
+    }
+}

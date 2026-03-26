@@ -1,0 +1,482 @@
+#include <iostream>
+#include <cmath>
+#include <vector>
+#include <functional>
+
+#include <blockforest/Initialization.h>
+#include <core/all.h>
+#include <core/Environment.h>
+#include <core/mpi/all.h>
+#include <domain_decomposition/all.h>
+#include <field/all.h>
+#include <geometry/all.h>
+#include <lbm/all.h>
+#include <lbm/vtk/all.h>
+#include <lbm_generated/field/AddToStorage.h>
+#include <timeloop/all.h>
+
+#include "conversion/Conversion.h"
+#include "domain/BoundaryHandling.h"
+#include "domain/BoundarySetter.h"
+#include "domain/BoundarySetup.h"
+#include "domain/DomainInitialiser.h"
+#include "domain/DomainSetup.h"
+#include "output/TurbineOutput.h"
+#include "walberla_helper/field/all.h"
+#include "wind_turbine_core/ProjectDefines.h"
+
+#include "waLBerlaABL_KernelInfo.h"
+#include "FlowDriverCollection.h"
+
+namespace turbine_core {
+
+    static const uint_t fieldGhostLayers = 1;
+
+    using TurbineOutput_T = output::TurbineOutput<
+            FlagField_T, ScalarField_T, VectorField_T, SecondOrderTensorField_T, ThirdOrderTensorField_T,
+            PdfField_T, Stencil_T, StorageSpecification_T::zeroCenteredPDFs, StorageSpecification_T::compressible
+    >;
+
+    template<typename Type_T>
+    using GPUField_T = walberla::gpu::GPUField<Type_T>;
+
+    int main(int argc, char** argv) {
+
+        walberla::Environment walberlaEnv(argc, argv);
+
+        walberla::logging::Logging::instance()->setLogLevel(walberla::logging::Logging::INFO);
+
+        /// general simulation parameters
+        auto globalConfig = walberlaEnv.config();
+        auto parameters = globalConfig->getOneBlock("Parameters");
+
+        uint_t timesteps = parameters.getParameter<uint_t>("timesteps", uint_t(10));
+        ++timesteps;
+        const real_t remainingTimeLoggerFrequency = parameters.getParameter<real_t>("remainingTimeLoggerFrequency", real_t(3.0)); // in seconds
+
+        const real_t length_SI = parameters.getParameter<real_t>("length_SI");
+        const real_t length_LU = parameters.getParameter<real_t>("length_LU");
+        const real_t velocity_SI = parameters.getParameter<real_t>("velocity_SI");
+        const real_t velocity_LU = parameters.getParameter<real_t>("velocity_LU");
+        const real_t viscosity_SI = parameters.getParameter<real_t>("viscosity_SI");
+        const real_t density_SI = parameters.getParameter<real_t>("density_SI");
+
+        Conversion::calculateConversionFactors(length_SI, length_LU, velocity_SI, velocity_LU, density_SI);
+        Conversion::print();
+
+        /// parameter conversion
+        real_t viscosity_LU = (viscosity_SI / density_SI) * Conversion::C_t() / Conversion::C_l() / Conversion::C_l();
+
+        WALBERLA_CHECK_GREATER(viscosity_LU, real_t(0.0), "Negative LU velocity - Did you calculate the conversion factors?")
+
+        // calculate omega on coarsest level
+        const real_t omega = walberla::lbm::collision_model::omegaFromViscosity(viscosity_LU);
+        WALBERLA_LOG_INFO_ON_ROOT("omega = " << omega)
+
+        /// BLOCKFOREST
+
+        WALBERLA_LOG_INFO_ON_ROOT("Creating blockforest...")
+
+        auto boundariesConfig = globalConfig->getOneBlock("Boundaries");
+        domain::BoundarySetup boundarySetup(boundariesConfig);
+
+        domain::DomainSetup domainSetup(globalConfig, boundarySetup.periodicity());
+
+        std::vector<AABB> emptyAABBs;
+        auto blocks = domainSetup.createUniformBlockForest(emptyAABBs);
+
+        /// FIELDS
+
+        WALBERLA_LOG_INFO_ON_ROOT("Creating fields...")
+
+        // layout - DO NOT CHANGE
+        auto layout = codegen::KernelInfo::layout;
+        const StorageSpecification_T storageSpec{};
+
+        std::map<output::Fields::Types, BlockDataID> fieldMap{};
+        uint_t initialWelfordCounter = 0;
+
+        auto allocator = std::make_shared< walberla::gpu::HostFieldAllocator<real_t> >();
+
+        BlockDataID forceFieldCpuID;
+        BlockDataID meanVelocityOutputFieldCpuID;
+        BlockDataID meanVelocityWfbFieldCpuID;
+        BlockDataID pdfFieldCpuID;
+        BlockDataID sumOfCubesFieldCpuID;
+        BlockDataID sumOfSquaresFieldCpuID;
+
+        if(domainSetup.snapshotHandler_->loadSnapshot) {
+
+            auto & ssh = domainSetup.snapshotHandler_;
+
+            auto vectorFieldDataHandling = std::make_shared<field::FlattenedFieldHandling<VectorField_T>>(blocks, fieldGhostLayers, layout, allocator);
+            const auto forceFileName = std::string(walberla::filesystem::path(ssh->baseFolder) / walberla::filesystem::path(ssh->forceFile).c_str());
+
+            forceFieldCpuID = blocks->loadBlockData(forceFileName, vectorFieldDataHandling, "force field CPU");
+
+            auto pdfFieldDataHandling = std::make_shared< walberla::lbm_generated::internal::PdfFieldHandling< StorageSpecification_T > >( blocks, storageSpec, fieldGhostLayers, layout, allocator );
+
+            const auto pdfFileName = std::string(walberla::filesystem::path(ssh->baseFolder) / walberla::filesystem::path(ssh->pdfFile).c_str());
+            pdfFieldCpuID = blocks->loadBlockData(pdfFileName, pdfFieldDataHandling, "pdf field CPU");
+
+            if(!ssh->meanVelFile.empty()) {
+                const auto meanVelFileName = std::string(walberla::filesystem::path(ssh->baseFolder) / walberla::filesystem::path(ssh->meanVelFile).c_str());
+                initialWelfordCounter = ssh->welfordCounter;
+
+                meanVelocityWfbFieldCpuID    = blocks->loadBlockData(meanVelFileName, vectorFieldDataHandling, "mean velocity wfb field CPU");
+                meanVelocityOutputFieldCpuID = blocks->loadBlockData(meanVelFileName, vectorFieldDataHandling, "mean velocity output field CPU");
+
+                if(!ssh->sosFile.empty()) {
+                    auto secondOrderTensorFieldDataHandling = std::make_shared<field::FlattenedFieldHandling<SecondOrderTensorField_T>>(blocks, fieldGhostLayers, layout, allocator);
+                    const auto sosFileName = std::string(walberla::filesystem::path(ssh->baseFolder) / walberla::filesystem::path(ssh->sosFile).c_str());
+                    sumOfSquaresFieldCpuID = blocks->loadBlockData(sosFileName, secondOrderTensorFieldDataHandling, "sum of squares field");
+                }
+                if(!ssh->socFile.empty()) {
+                    auto thirdOrderTensorFieldDataHandling = std::make_shared<field::FlattenedFieldHandling<ThirdOrderTensorField_T>>(blocks, fieldGhostLayers, layout, allocator);
+                    const auto socFileName = std::string(walberla::filesystem::path(ssh->baseFolder) / walberla::filesystem::path(ssh->socFile).c_str());
+                    sumOfCubesFieldCpuID = blocks->loadBlockData(socFileName, thirdOrderTensorFieldDataHandling, "sum of cubes field CPU");
+                }
+            }
+
+        } else {
+            forceFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "force field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+            meanVelocityOutputFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "mean velocity output field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+            meanVelocityWfbFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "mean velocity wfb field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+            pdfFieldCpuID = walberla::lbm_generated::addPdfFieldToStorage(blocks, "pdf field CPU", storageSpec, fieldGhostLayers, layout,
+                                                                         walberla::Set<walberla::SUID>::emptySet(), walberla::Set<walberla::SUID>::emptySet(), allocator);
+            sumOfCubesFieldCpuID = walberla::field::addToStorage<ThirdOrderTensorField_T>(blocks, "sum of cubes field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+            sumOfSquaresFieldCpuID = walberla::field::addToStorage<SecondOrderTensorField_T>(blocks, "sum of squares field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        }
+
+        BlockDataID densityFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "density field CPU", real_t(1), layout, fieldGhostLayers, allocator);
+        BlockDataID eddyViscosityFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "eddy viscosity field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID flagFieldID = walberla::field::addFlagFieldToStorage<FlagField_T>(blocks, "flag field", fieldGhostLayers);
+        BlockDataID meanEddyViscosityFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "mean eddy viscosity field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID meanStrainRateFieldCpuID = walberla::field::addToStorage<SecondOrderTensorField_T>(blocks, "mean strain rate field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID omegaFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "omega field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID strainRateFieldCpuID = walberla::field::addToStorage<SecondOrderTensorField_T>(blocks, "strain rate field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID velocityFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "velocity field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+
+        fieldMap[output::Fields::DENSITY] = densityFieldCpuID;
+        fieldMap[output::Fields::EDDY_VISCOSITY] = eddyViscosityFieldCpuID;
+        fieldMap[output::Fields::FLAG] = flagFieldID;
+        fieldMap[output::Fields::FORCE] = forceFieldCpuID;
+        fieldMap[output::Fields::MEAN_EDDY_VISCOSITY] = meanEddyViscosityFieldCpuID;
+        fieldMap[output::Fields::MEAN_STRAIN_RATE] = meanStrainRateFieldCpuID;
+        fieldMap[output::Fields::MEAN_VELOCITY_OUTPUT] = meanVelocityOutputFieldCpuID;
+        fieldMap[output::Fields::MEAN_VELOCITY_WFB] = meanVelocityWfbFieldCpuID;
+        fieldMap[output::Fields::OMEGA] = omegaFieldCpuID;
+        fieldMap[output::Fields::PDF] = pdfFieldCpuID;
+        fieldMap[output::Fields::STRAIN_RATE] = strainRateFieldCpuID;
+        fieldMap[output::Fields::SUM_OF_CUBES] = sumOfCubesFieldCpuID;
+        fieldMap[output::Fields::SUM_OF_SQUARES] = sumOfSquaresFieldCpuID;
+        fieldMap[output::Fields::VELOCITY] = velocityFieldCpuID;
+
+        /// ABL calculations
+
+        auto initParams = globalConfig->getOneBlock("Initialisation");
+        const auto initType = domain::DomainInitialisation::toType(initParams.getParameter<std::string>("type"));
+        const Vector3<real_t> initialVelocity = initParams.getParameter<Vector3<real_t>>("initialVelocity");
+
+        const real_t kappa = parameters.getParameter<real_t>("kappa", real_t(0.42));
+        const real_t B = parameters.getParameter<real_t>("B", real_t(5.5));
+        const real_t roughnessLengthRatio = parameters.getParameter<real_t>("roughnessLengthRatio", real_t(1e-4));
+        const real_t referenceHeight = parameters.getParameter<real_t>("referenceHeight_LU", real_t(-1));
+        const uint32_t samplingHeight = parameters.getParameter<uint32_t>("samplingHeight_LU", uint32_t(0));
+        const real_t roughnessLength = roughnessLengthRatio * referenceHeight;
+
+        const uint_t welfordInterval = walberlaEnv.config()->getOneBlock("Output").getParameter<uint_t>("welfordInterval", uint_t(0));
+        // uTau from MOST
+        const real_t uTau = kappa * initialVelocity[0] / std::log(real_t(1) / roughnessLengthRatio);
+
+        /// DOMAIN INITIALISATION
+
+        WALBERLA_LOG_INFO_ON_ROOT("Initialise domain...")
+        if(!domainSetup.snapshotHandler_->loadSnapshot) {
+
+            std::unique_ptr<domain::DomainInitialisation> initialiser{};
+            if(initType == domain::DomainInitialisation::UNIFORM) {
+                initialiser = std::make_unique<domain::UniformInitialisation>(blocks, initialVelocity);
+            } else if(initType == domain::DomainInitialisation::ASMUTH) {
+                initialiser = std::make_unique<domain::AsmuthInitialisation>(blocks, uTau, roughnessLength, kappa, B,
+                                                                             viscosity_LU, domainSetup.domainSize_, true);
+            } else if(initType == domain::DomainInitialisation::LOG_LAW) {
+                // asmuth without perturbation velocities
+                initialiser = std::make_unique<domain::AsmuthInitialisation>(blocks, uTau, roughnessLength, kappa, B,
+                                                                             viscosity_LU, domainSetup.domainSize_, false);
+            }
+
+            using PdfSetter_T = walberla::pystencils::waLBerlaABL_PdfSetter;
+            PdfSetter_T setter(densityFieldCpuID, forceFieldCpuID, pdfFieldCpuID, velocityFieldCpuID);
+            initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(velocityFieldCpuID, setter);
+            initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(meanVelocityOutputFieldCpuID, setter);
+            initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(meanVelocityWfbFieldCpuID, setter);
+
+        } else {
+
+            if(domainSetup.snapshotHandler_->meanVelFile.empty()) {
+                WALBERLA_ABORT("Mean velocity not loaded from snapshot but also not initialised.")
+            }
+
+            // initialise velocity field from pdf field if snapshot
+            walberla::pystencils::waLBerlaABL_MacroGetter getter(densityFieldCpuID, forceFieldCpuID, pdfFieldCpuID, velocityFieldCpuID);
+            for(auto & block : *blocks) {
+                getter(&block);
+            }
+        }
+
+        WALBERLA_LOG_INFO_ON_ROOT("Add GPU fields...")
+
+        BlockDataID densityFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>( blocks, densityFieldCpuID, "density field GPU", true );
+        BlockDataID eddyViscosityFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>( blocks, eddyViscosityFieldCpuID, "eddy viscosity field GPU", true );
+        BlockDataID forceFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>( blocks, forceFieldCpuID, "force field GPU", true );
+        BlockDataID meanEddyViscosityFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>( blocks, meanEddyViscosityFieldCpuID, "mean eddy viscosity field GPU", true );
+        BlockDataID meanStrainRateFieldGpuID = walberla::gpu::addGPUFieldToStorage<SecondOrderTensorField_T>( blocks, meanStrainRateFieldCpuID, "mean strain rate field GPU", true );
+        BlockDataID meanVelocityOutputFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>( blocks, meanVelocityOutputFieldCpuID, "mean velocity output field GPU", true );
+        BlockDataID meanVelocityWfbFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>( blocks, meanVelocityWfbFieldCpuID, "mean velocity wfb field GPU", true );
+        BlockDataID omegaFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>( blocks, omegaFieldCpuID, "omega field GPU", true );
+        BlockDataID pdfFieldGpuID = walberla::lbm_generated::addGPUPdfFieldToStorage<PdfField_T, StorageSpecification_T >(blocks, pdfFieldCpuID, storageSpec, "pdf field GPU");
+        BlockDataID strainRateFieldGpuID = walberla::gpu::addGPUFieldToStorage<SecondOrderTensorField_T>( blocks, strainRateFieldCpuID, "strain rate field GPU", true );
+        BlockDataID sumOfCubesFieldGpuID = walberla::gpu::addGPUFieldToStorage<ThirdOrderTensorField_T>( blocks, sumOfCubesFieldCpuID, "sum of cubes field GPU", true );
+        BlockDataID sumOfSquaresFieldGpuID = walberla::gpu::addGPUFieldToStorage<SecondOrderTensorField_T>( blocks, sumOfSquaresFieldCpuID, "sum of squares field GPU", true );
+        BlockDataID velocityFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>( blocks, velocityFieldCpuID, "velocity field GPU", true );
+
+        SweepCollection_T sweepCollection( blocks, densityFieldGpuID, eddyViscosityFieldGpuID, forceFieldGpuID, omegaFieldGpuID,
+                                           pdfFieldGpuID, velocityFieldGpuID, omega );
+
+        WALBERLA_MPI_BARRIER()
+        WALBERLA_LOG_INFO_ON_ROOT("Initialisation done")
+
+        /// BOUNDARIES
+
+        WALBERLA_LOG_INFO_ON_ROOT("Setting up boundaries...")
+
+        boundarySetup.fillFlagFieldFromConfig<FlagField_T>(blocks, flagFieldID, FluidFlagUID,
+                                                           NoSlipFlagUID, WFBFlagUID, SymmetryFlagUID, UniformInflowFlagUID,
+                                                           LogLawInflowFlagUID, OutflowFlagUID);
+
+        if(boundarySetup.wallType() == WallSetup::WFB) {
+            WALBERLA_CHECK(referenceHeight > real_t(0), "Reference height must be given in the parameter file for wall function boundary conditions.")
+            WALBERLA_CHECK(boundarySetup.environmentSetup() != EnvironmentSetup::Tunnel,
+                           "Wall-function bounce is currently not supported for the tunnel environment")
+            WALBERLA_CHECK(samplingHeight > uint_t(0), "Sampling height must be given in the parameter file for wall function boundary conditions.")
+        }
+
+        const auto& inflowVelocity = boundarySetup.inflowVelocity();
+        auto velocityInit = boundary::velocityInit(roughnessLength, kappa, uTau);
+        BoundaryCollection_T boundaryCollection(
+                blocks, flagFieldID, pdfFieldGpuID, FluidFlagUID, forceFieldGpuID,
+                meanVelocityWfbFieldGpuID, samplingHeight,
+                roughnessLengthRatio * referenceHeight,
+                inflowVelocity[0], inflowVelocity[1], inflowVelocity[2], velocityInit,
+                pdfFieldCpuID
+        );
+
+        const int periodicShiftValue = boundariesConfig.getParameter<int>("periodicShiftValue", int(real_t(0.33) * real_t(domainSetup.domainSize_[2])));
+        walberla::gpu::ShiftedPeriodicityGPU<PdfGPUField_T> shiftedPeriodicity(blocks, pdfFieldGpuID, fieldGhostLayers,
+                                                                               0, 1, periodicShiftValue);
+
+        /// field resetter
+
+        walberla::pystencils::waLBerlaABL_SoSResetter welfordOutputSosResetter(sumOfSquaresFieldGpuID);
+        walberla::pystencils::waLBerlaABL_SoCResetter welfordOutputSocResetter(sumOfCubesFieldGpuID);
+
+        /// WELFORDWFB
+        walberla::pystencils::waLBerlaABL_WelfordWFB welfordWFBSweep(
+                meanVelocityWfbFieldGpuID, velocityFieldGpuID,
+                real_t(initialWelfordCounter));
+        /// WELFORDOUTPUT
+        walberla::pystencils::waLBerlaABL_WelfordOutput welfordOutputSweep(
+                meanVelocityOutputFieldGpuID, sumOfCubesFieldGpuID, sumOfSquaresFieldGpuID, velocityFieldGpuID,
+                real_t(initialWelfordCounter));
+        /// WELFORDEDDYVISCOSITY
+        walberla::pystencils::waLBerlaABL_WelfordEddyViscosity welfordEddyViscositySweep(
+                eddyViscosityFieldGpuID, meanEddyViscosityFieldGpuID,
+                real_t(initialWelfordCounter));
+        /// WELFORDSTRAINRATE
+        walberla::pystencils::waLBerlaABL_WelfordStrainRate welfordStrainRateSweep(
+                meanStrainRateFieldGpuID, strainRateFieldGpuID,
+                real_t(initialWelfordCounter));
+
+        /// COMMUNICATION
+
+        WALBERLA_LOG_INFO_ON_ROOT("Set up communication...")
+
+        bool cudaEnabledMPI = parameters.getParameter<bool>("cudaEnabledMPI", false);
+        if(walberla::mpi::MPIManager::instance()->numProcesses() == 1) {
+            cudaEnabledMPI = false;
+        }
+
+        auto communication = std::make_shared<walberla::gpu::communication::UniformGPUScheme<CommunicationStencil_T>>(blocks, cudaEnabledMPI);
+        auto pdfPackInfo = std::make_shared< walberla::lbm_generated::UniformGeneratedGPUPdfPackInfo<PdfGPUField_T> >(pdfFieldGpuID);
+        communication->addPackInfo(pdfPackInfo);
+        auto densityPackInfo = std::make_shared< walberla::gpu::communication::MemcpyPackInfo<GPUField_T<real_t>> >(densityFieldGpuID);
+        communication->addPackInfo(densityPackInfo);
+        auto velocityPackInfo = std::make_shared< walberla::gpu::communication::MemcpyPackInfo<GPUField_T<real_t>> >(velocityFieldGpuID);
+        communication->addPackInfo(velocityPackInfo);
+
+        /// TIMELOOP
+
+        WALBERLA_LOG_INFO_ON_ROOT("Creating time loop...")
+
+#ifdef NDEBUG
+        using TimingPolicy_T = walberla::timing::WcPolicy;
+#else
+        using TimingPolicy_T = walberla::timing::DeviceSynchronizePolicy;
+#endif
+
+        auto timeloop = walberla::timeloop::SweepTimeloop<TimingPolicy_T>(blocks->getBlockStorage(), timesteps);
+
+        /// driving forces
+        walberla::wind::FlowDriverCollection flowDriver(blocks, &timeloop, globalConfig, domainSetup, forceFieldGpuID, velocityFieldGpuID, fieldGhostLayers);
+        for(auto & block : *blocks) { flowDriver(&block); }
+
+        /// OUTPUT
+        TurbineOutput_T turbineOutput{
+                blocks, &timeloop,
+                globalConfig->getOneBlock("Output"), FluidFlagUID,
+                fieldMap
+        };
+
+        walberla::pystencils::waLBerlaABL_StrainRateWriter strainRateWriter(forceFieldGpuID, omegaFieldGpuID, pdfFieldGpuID, strainRateFieldGpuID);
+        turbineOutput.addBeforeFunction([&]() {
+            for(auto & block : *blocks) {
+                strainRateWriter(&block);
+            }
+        });
+
+        turbineOutput.addBeforeFunction([&]() {
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, densityFieldCpuID, densityFieldGpuID);
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, velocityFieldCpuID, velocityFieldGpuID);
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, forceFieldCpuID, forceFieldGpuID);
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, meanVelocityOutputFieldCpuID, meanVelocityOutputFieldGpuID);
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>(blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID);
+            walberla::gpu::fieldCpy<ThirdOrderTensorField_T, GPUField_T<real_t>>(blocks, sumOfCubesFieldCpuID, sumOfCubesFieldGpuID);
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, eddyViscosityFieldCpuID, eddyViscosityFieldGpuID);
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, meanEddyViscosityFieldCpuID, meanEddyViscosityFieldGpuID);
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>(blocks, meanStrainRateFieldCpuID, meanStrainRateFieldGpuID);
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, omegaFieldCpuID, omegaFieldGpuID);
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>(blocks, strainRateFieldCpuID, strainRateFieldGpuID);
+
+            cudaDeviceSynchronize();
+        });
+
+        auto output = [&turbineOutput]() { cudaDeviceSynchronize(); turbineOutput.write(); };
+
+        auto welfordWFBLambda = [&welfordWFBSweep](walberla::IBlock * block) { welfordWFBSweep(block); };
+        auto welfordOutputLambda = [&welfordOutputSweep](walberla::IBlock * block) { welfordOutputSweep(block); };
+        auto welfordEddyViscosityLambda = [&welfordEddyViscositySweep](walberla::IBlock * block) { welfordEddyViscositySweep(block); };
+        auto welfordStrainRateLambda = [&welfordStrainRateSweep](walberla::IBlock * block) { welfordStrainRateSweep(block); };
+
+        timeloop.add() << walberla::BeforeFunction(communication->getCommunicateFunctor(), "Field communication")
+                       << walberla::BeforeFunction([&boundarySetup, &shiftedPeriodicity]() {
+                           if(boundarySetup.inflowType() == InflowSetup::ShiftedPeriodic) shiftedPeriodicity();
+                       }, "Shifted periodicity")
+                       << walberla::Sweep(boundaryCollection.getSweep(), "Boundary Handling");
+
+        timeloop.add() << walberla::Sweep(sweepCollection.streamCollide(), "LBM stream-collide")
+                       << walberla::AfterFunction(output, "VTK output")
+                       << walberla::AfterFunction([&]() {
+                           if((domainSetup.snapshotHandler_->storeSnapshot) &&
+                              (timeloop.getCurrentTimeStep() % domainSetup.snapshotHandler_->snapshotFrequency == 0) &&
+                              (timeloop.getCurrentTimeStep() > 0)) {
+                               walberla::gpu::fieldCpy<PdfField_T, GPUField_T<real_t>>(blocks, pdfFieldCpuID, pdfFieldGpuID);
+                               walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, forceFieldCpuID, forceFieldGpuID);
+                               walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, meanVelocityWfbFieldCpuID, meanVelocityWfbFieldGpuID);
+                               walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>(blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID);
+                               walberla::gpu::fieldCpy<ThirdOrderTensorField_T, GPUField_T<real_t>>(blocks, sumOfCubesFieldCpuID, sumOfCubesFieldGpuID);
+                               gpuDeviceSynchronize();
+                               domainSetup.snapshotHandler_->createSnapshot(timeloop.getCurrentTimeStep(), blocks, pdfFieldCpuID, forceFieldCpuID,
+                                                                            uint_t(welfordWFBSweep.getCounter()), meanVelocityWfbFieldCpuID,
+                                                                            sumOfSquaresFieldCpuID, sumOfCubesFieldCpuID);
+                           }
+                       }, "Snapshot creation");
+
+        if(boundarySetup.wallType() == WallSetup::WFB) {
+            timeloop.add() << walberla::BeforeFunction([&]() { welfordWFBSweep.setCounter(real_t(welfordWFBSweep.getCounter() + 1)); }, "WelfordWFB Sweep")
+                           << walberla::Sweep(welfordWFBLambda, "WelfordWFB Sweep");
+        }
+
+        timeloop.add() << walberla::BeforeFunction([&]() {
+                            if(welfordInterval && (uint_t(welfordOutputSweep.getCounter()) % welfordInterval == 0)) {
+                                welfordOutputSweep.setCounter(real_t(1));
+                                for(auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt) {
+                                    auto dst = blockIt->getData<GPUField_T<real_t>>(meanVelocityOutputFieldGpuID);
+                                    const auto src = blockIt->getData<GPUField_T<real_t>>(velocityFieldGpuID);
+                                    gpu::fieldCopy(dst, src);
+                                    welfordOutputSosResetter(blockIt.get());
+                                    welfordOutputSocResetter(blockIt.get());
+                                }
+                            } else {
+                                welfordOutputSweep.setCounter(real_t(welfordOutputSweep.getCounter() + 1));
+                            }
+                       }, "WelfordOutput Sweep")
+                       << walberla::Sweep(welfordOutputLambda, "WelfordOutput Sweep");
+
+        timeloop.add() << walberla::BeforeFunction([&]() {
+                            if(welfordInterval && (uint_t(welfordEddyViscositySweep.getCounter()) % welfordInterval == 0)) {
+                                welfordEddyViscositySweep.setCounter(real_t(1));
+                                for(auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt) {
+                                    auto dst = blockIt->getData<GPUField_T<real_t>>(meanEddyViscosityFieldGpuID);
+                                    const auto src = blockIt->getData<GPUField_T<real_t>>(eddyViscosityFieldGpuID);
+                                    gpu::fieldCopy(dst, src);
+                                }
+                            } else {
+                                welfordEddyViscositySweep.setCounter(real_t(welfordEddyViscositySweep.getCounter() + 1));
+                            }
+                       }, "WelfordEddyViscosity Sweep")
+                       << walberla::Sweep(welfordEddyViscosityLambda, "WelfordEddyViscosity Sweep");
+
+        timeloop.add() << walberla::BeforeFunction([&]() {
+                            if(welfordInterval && (uint_t(welfordStrainRateSweep.getCounter()) % welfordInterval == 0)) {
+                                welfordStrainRateSweep.setCounter(real_t(1));
+                                for(auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt) {
+                                    auto dst = blockIt->getData<GPUField_T<real_t>>(meanStrainRateFieldGpuID);
+                                    const auto src = blockIt->getData<GPUField_T<real_t>>(strainRateFieldGpuID);
+                                    gpu::fieldCopy(dst, src);
+                                }
+                            } else {
+                                welfordStrainRateSweep.setCounter(real_t(welfordStrainRateSweep.getCounter() + 1));
+                            }
+                       }, "WelfordStrainRate Sweep")
+                       << walberla::Sweep(welfordStrainRateLambda, "WelfordStrainRate Sweep");
+
+        timeloop.add() << walberla::Sweep(flowDriver, "Setting driving force");
+
+        timeloop.addFuncAfterTimeStep(walberla::makeSharedFunctor(
+                walberla::field::makeStabilityChecker< PdfField_T, FlagField_T >(globalConfig, blocks, pdfFieldCpuID, flagFieldID, FluidFlagUID )),
+                "LBM stability check");
+
+        timeloop.addFuncAfterTimeStep(walberla::timing::RemainingTimeLogger(timeloop.getNrOfTimeSteps(), remainingTimeLoggerFrequency),
+                                      "Remaining time logger");
+
+        WALBERLA_LOG_INFO_ON_ROOT("Running timeloop...")
+        WALBERLA_MPI_WORLD_BARRIER()
+
+        walberla::timing::TimingPool<TimingPolicy_T> timing;
+        walberla::WcTimer timer;
+        timer.start();
+
+        for(uint_t i = 0; i < timesteps; ++i) {
+            timeloop.singleStep(timing);
+        }
+
+        timer.end();
+
+        double time = timer.max();
+        walberla::mpi::reduceInplace(time, walberla::mpi::MAX);
+
+        const auto timeloopTiming = timing.getReduced();
+        WALBERLA_LOG_INFO_ON_ROOT("Timeloop timing:\n" << *timeloopTiming)
+
+        walberla::lbm::PerformanceEvaluation<FlagField_T> performance(blocks, flagFieldID, FluidFlagUID);
+        performance.logResultOnRoot(timesteps, time);
+
+        return EXIT_SUCCESS;
+    }
+
+} // namespace turbine_core
+
+int main(int argc, char** argv) {
+    return turbine_core::main(argc, argv);
+}
