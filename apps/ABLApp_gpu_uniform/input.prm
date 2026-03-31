@@ -1,7 +1,7 @@
 DomainSetup
 {
-    domainSize    <192, 192, 128>;
-    cellsPerBlock <16, 16, 16>;
+    domainSize    <320, 160, 160>;
+    cellsPerBlock <64, 64, 64>;
 
     loadSnapshot    0;
     storeSnapshot   0;
@@ -17,7 +17,7 @@ DomainSetup
 
 Parameters
 {
-    timesteps          3000;
+    timesteps          30000;
 
     length_SI             160;
     length_LU              16.0;
@@ -52,8 +52,8 @@ Boundaries
 {
     setup                   Open;
 
-    inflowType              logLawInflow; // periodic, shiftedPeriodic, logLawInflow, uniformInflow
-    outflowType             Outflow;
+    inflowType              periodic; // periodic, shiftedPeriodic, logLawInflow, uniformInflow
+    outflowType             periodic;
 
     inflowVelocity          <0.05, 0, 0>; // Only applicable if inflowType is set uniformInflow
     outflowPressure         1.0; //not used in this application
@@ -64,14 +64,7 @@ Boundaries
     elementDistance 0;
     elementLength 0;
 
-    Body
-    {
-        shape box;
-        min <38, 86, 0>;
-        max <58, 106, 20>;
-        flag NoSlip Flag;
 
-    }
 }
 
 StabilityChecker
@@ -87,6 +80,7 @@ Output
     VTK
     {
         writeFrequency 100;
+        startTimestep  20000;
         ghostLayers    0;
 
         baseFolder           vtk_out;
