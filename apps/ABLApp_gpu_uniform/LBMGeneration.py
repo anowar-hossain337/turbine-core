@@ -120,15 +120,24 @@ with CodeGeneration() as ctx:
 
     # lattice Boltzmann method
 
-    stencil = LBStencil(Stencil.D3Q27)
+    # stencil = LBStencil(Stencil.D3Q27)
+    stencil = LBStencil(Stencil.D3Q19)
     q = stencil.Q
+
+    # newlines to disable galilean correction for D3Q19 (as it  is not supported in cumulant method for D3Q19)
+    use_galilean_correction = stencil.name == 'D3Q27'
+    fourth_order_correction = 0.1 if use_galilean_correction else 0.0
 
     pdfs, pdfs_tmp = ps.fields(f"pdfs({q}), pdfs_tmp({q}): {data_type}[3D]", layout=layout)
     macroscopic_fields = {'density': density_field, 'velocity': velocity_field}
 
     lbm_config = LBMConfig(stencil=stencil, streaming_pattern=streaming_pattern,
                            method=Method.CUMULANT, relaxation_rate=omega,
-                           galilean_correction=True, fourth_order_correction=0.1,
+                           # galilean_correction=True, fourth_order_correction=0.1,
+                           # following 2 lines are added to enable galillean correction for D3Q27 and disable it for D3Q19 (as it is not supported in cumulant method for D3Q19)
+                           galilean_correction=use_galilean_correction, 
+                           fourth_order_correction=fourth_order_correction,
+                           # above 2 lines are added to enable galillean correction for D3Q27 and disable it for D3Q19 (as it is not supported in cumulant method for D3Q19)
                            force_model=ForceModel.GUO, force=force_field.center_vector,
                            subgrid_scale_model=SubgridScaleModel.SMAGORINSKY,
                            compressible=True, zero_centered=True,

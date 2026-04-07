@@ -247,6 +247,7 @@ int main(int argc, char** argv) {
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(densityFieldCpuID, "Density"));
         fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<VectorField_T>>(velocityFieldCpuID, "Velocity"));
         fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<VectorField_T>>(meanVelocityOutputFieldCpuID, "MeanVelocityOutput"));
+        fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<SecondOrderTensorField_T>>(sumOfSquaresFieldCpuID, "SumOfSquares"));
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<VectorField_T>>(forceFieldCpuID, "Force"));
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(eddyViscosityFieldCpuID, "EddyViscosity"));
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(omegaFieldCpuID, "Omega"));
@@ -267,6 +268,7 @@ int main(int argc, char** argv) {
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, densityFieldCpuID, densityFieldGpuID);
         walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, velocityFieldCpuID, velocityFieldGpuID);
         walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, meanVelocityOutputFieldCpuID, meanVelocityOutputFieldGpuID);
+        walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>(blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID);
         //walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, forceFieldCpuID, forceFieldGpuID);
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, eddyViscosityFieldCpuID, eddyViscosityFieldGpuID);
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, omegaFieldCpuID, omegaFieldGpuID);
