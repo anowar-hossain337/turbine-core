@@ -1,7 +1,7 @@
 DomainSetup
 {
-    domainSize    <320, 160, 160>;
-    cellsPerBlock <64, 64, 64>;
+    domainSize    <150, 150, 75>;
+    cellsPerBlock <150, 150, 75>;
 
     loadSnapshot    0;
     storeSnapshot   0;
@@ -17,26 +17,28 @@ DomainSetup
 
 Parameters
 {
-    timesteps          30000;
+    timesteps          2400000;
 
-    length_SI             160;
-    length_LU              16.0;
+    length_SI             20;
+    length_LU              150;
 
-    velocity_SI            5;
-    velocity_LU             0.05;
+    velocity_SI            185;
+    velocity_LU            1;
 
-    viscosity_SI           0.0000189;
-    density_SI             1;
+    viscosity_SI           0.00001776;
+    density_SI             1.225;
 
-    remainingTimeLoggerFrequency 5; // in seconds
+    remainingTimeLoggerFrequency 60; // in seconds
 
-    roughnessLengthRatio 0.000625;
-    referenceHeight_LU   16;
-    samplingHeight_LU    8;
+    roughnessLengthRatio 0.0000277778;// 0.000027536
+    referenceHeight_LU   81;
+    samplingHeight_LU    12;
+
+    compressible           true; // Read by LBMGeneration.py at code-generation time (rebuild required after changes)
 
     driverType          pressureGradient; //none, pressureGradient, dynamicPressureGradient, coriolisForce
     coriolisFrequency   0.0001; // given in s^-1; Only applicable if drivertype is coriolisForce
-    geostrophicWind     <10, 0, 0>; // given in m*s^-1, the third component should ALWAYS be 0; Only applicable if drivertype is coriolisForce
+    geostrophicWind     <0, 0, 0>; // given in m*s^-1, the third component should ALWAYS be 0; Only applicable if drivertype is coriolisForce
     windDirectionDegrees 0; // Only applicable if drivertype is pressureGradient
     windDirectionChangeRateTable "windDirectionChange.wd"; // Only applicable if drivertype is dynamicPressureGradient
 
@@ -44,8 +46,8 @@ Parameters
 }
 
 Initialisation {
-    type asmuth; // logLaw; // uniform;
-    initialVelocity <0.075, 0, 0>; //Used to calculate friction velocity
+    type asmuth; // logLaw; // uniform; //asmuth;
+    initialVelocity <1.621621622e-1, 0, 0>; //Used to calculate friction velocity
 }
 
 Boundaries
@@ -58,7 +60,12 @@ Boundaries
     inflowVelocity          <0.05, 0, 0>; // Only applicable if inflowType is set uniformInflow
     outflowPressure         1.0; //not used in this application
 
-    wallType                WFB;
+        wallType                WFB; // 1 WFB 2 NoSlip
+        topBoundaryType        slip; // symmetry/slip/outflow
+        topDampingHeight        0; // cells below the top boundary; 0 disables damping
+        topDampingMaxStrength   0.02; // LU relaxation strength at the top cell
+        topDampingHorizontal    true; // relax u,v toward the running mean field
+        topDampingVertical      true; // relax w toward zero
 
     numberElements 0;
     elementDistance 0;
@@ -69,21 +76,21 @@ Boundaries
 
 StabilityChecker
 {
-    checkFrequency 100;
+    checkFrequency 10000;
     streamOutput   false;
     vtkOutput      true;
 }
 
 Output
 {
-    welfordInterval 100;
+    welfordInterval 1200000;
     VTK
     {
-        writeFrequency 100;
-        startTimestep  20000;
+        writeFrequency 2400000;
+        startTimestep  2399990;
         ghostLayers    0;
 
-        baseFolder           vtk_out;
+        baseFolder           vtk_out_SH_12_WFB_X150_WI_1200000_TB_slip_Initialization_asmuth_Perturbation_xy_SigmaN_36_TEST_1_Double_Single_precision_Comparison;
         executionFolder      simulation_step;
 
         fields {
