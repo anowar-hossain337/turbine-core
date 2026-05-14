@@ -1,7 +1,13 @@
 from dataclasses import replace
 
+# This is added to allow reading parameters from input.prm file to set compressibility of the flow. The function looks for a parameter named "compressible" in the input.prm file and parses its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True.
+from pathlib import Path
+import re
+# The above imports are added to allow reading parameters from input.prm file to set compressibility of the flow. The function looks for a parameter named "compressible" in the input.prm file and parses its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True.
+
 import pystencils as ps
 import numpy as np
+import sympy as sp
 from lbmpy.macroscopic_value_kernels import pdf_initialization_assignments, macroscopic_values_getter
 from lbmpy.flow_statistics import welford_assignments
 from lbmpy.utils import second_order_moment_tensor
@@ -47,6 +53,7 @@ static const walberla::FlagUID SymmetryFlagUID("{symmetry_flag}");
 static const walberla::FlagUID UniformInflowFlagUID("{uniform_inflow_flag}");
 static const walberla::FlagUID LogLawInflowFlagUID("{loglaw_inflow_flag}");
 static const walberla::FlagUID OutflowFlagUID("{outflow_flag}");
+static const walberla::FlagUID TopOutflowFlagUID("{top_outflow_flag}");
 
 namespace codegen {{
 
@@ -95,6 +102,36 @@ gpu_indexing_params = {'block_size': sweep_block_size}
 
 ghost_layers = 1
 
+# Parsing the "compressible" parameter from input.prm file to determine if the flow should be treated as compressible or incompressible. This is done by looking for a parameter named "compressible" in the input.prm file and parsing its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True (compressible flow).
+def _parse_bool_token(token: str):
+    value = token.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _load_compressible_from_prm(default=True):
+    candidates = [Path.cwd() / "input.prm", Path(__file__).with_name("input.prm")]
+    for prm_path in candidates:
+        if not prm_path.exists():
+            continue
+
+        content = prm_path.read_text(encoding="utf-8", errors="ignore")
+        parameters_match = re.search(r"Parameters\s*\{(?P<body>.*?)\}", content, flags=re.DOTALL)
+        search_space = parameters_match.group("body") if parameters_match else content
+        key_match = re.search(r"\bcompressible\b\s+([^\s;]+)", search_space)
+        if not key_match:
+            continue
+
+        parsed = _parse_bool_token(key_match.group(1))
+        if parsed is not None:
+            return parsed
+
+    return default
+# The above function is added to allow reading parameters from input.prm file to set compressibility of the flow. The function looks for a parameter named "compressible" in the input.prm file and parses its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True (compressible flow).
+
 with CodeGeneration() as ctx:
 
     target = Target.GPU
@@ -102,6 +139,10 @@ with CodeGeneration() as ctx:
     streaming_pattern = 'pull'
 
     omega = sp.Symbol("omega")
+    # Reading the compressibility of the flow from input.prm file using the function defined above. This allows users to set the flow as compressible or incompressible by specifying the "compressible" parameter in the input.prm file. If the parameter is not specified, it defaults to True (compressible flow).
+    # Defaut is true to maintain the same behaviour as before when the parameter was not read from the input.prm file.
+    compressible_flow = _load_compressible_from_prm(default=True)
+    # Above line is added to read the compressibility of the flow from input.prm file using the function defined above. This allows users to set the flow as compressible or incompressible by specifying the "compressible" parameter in the input.prm file. If the parameter is not specified, it defaults to True (compressible flow).
 
     data_type = 'double' if ctx.double_accuracy else 'float32'
 
@@ -109,7 +150,6 @@ with CodeGeneration() as ctx:
     velocity_field = ps.fields(f"velocity(3): {data_type}[3D]", layout=layout)
     mean_velocity_field = ps.fields(f"mean_velocity(3): {data_type}[3D]", layout=layout)
     sum_of_squares_field = ps.fields(f"sum_of_squares(9): {data_type}[3D]", layout=layout)
-    sum_of_cubes_field = ps.fields(f"sum_of_cubes(27): {data_type}[3D]", layout=layout)
     force_field = ps.fields(f"force(3): {data_type}[3D]", layout=layout)
     omega_field = ps.fields(f"omega_out: {data_type}[3D]", layout=layout)
     eddy_viscosity_field = ps.fields(f"eddy_viscosity: {data_type}[3D]", layout=layout)
@@ -140,7 +180,9 @@ with CodeGeneration() as ctx:
                            # above 2 lines are added to enable galillean correction for D3Q27 and disable it for D3Q19 (as it is not supported in cumulant method for D3Q19)
                            force_model=ForceModel.GUO, force=force_field.center_vector,
                            subgrid_scale_model=SubgridScaleModel.SMAGORINSKY,
-                           compressible=True, zero_centered=True,
+                            # read compressible parameter from input.prm file to set the flow as compressible or incompressible. This is done by looking for a parameter named "compressible" in the input.prm file and parsing its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True (compressible flow).
+                           compressible=compressible_flow, zero_centered=compressible_flow,
+                           # above line is added to read compressible parameter from input.prm file to set the flow as compressible or incompressible. This is done by looking for a parameter named "compressible" in the input.prm file and parsing its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True (compressible flow).
                            omega_output_field=omega_field,
                            eddy_viscosity_field=eddy_viscosity_field,
                            output=macroscopic_fields)
@@ -166,8 +208,7 @@ with CodeGeneration() as ctx:
 
     # Welford update for output
     welford_output_update = welford_assignments(field=velocity_field, mean_field=mean_velocity_field,
-                                                sum_of_squares_field=sum_of_squares_field,
-                                                sum_of_cubes_field=sum_of_cubes_field)
+                                                sum_of_squares_field=sum_of_squares_field)
     generate_sweep(ctx, "waLBerlaABL_WelfordOutput", welford_output_update, target=target,
                    gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
 
@@ -178,15 +219,6 @@ with CodeGeneration() as ctx:
             field_access @= sp.Float(0)
 
     generate_sweep(ctx, "waLBerlaABL_SoSResetter", ps.AssignmentCollection(sos_resetter), target=target,
-                   gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
-
-    @ps.kernel
-    def soc_resetter():
-        for d in range(stencil.D**3):
-            field_access = sum_of_cubes_field.center.at_index(d)
-            field_access @= sp.Float(0)
-
-    generate_sweep(ctx, "waLBerlaABL_SoCResetter", ps.AssignmentCollection(soc_resetter), target=target,
                    gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
 
     welford_nut_update = welford_assignments(field=eddy_viscosity_field, mean_field=mean_eddy_viscosity_field)
@@ -218,6 +250,7 @@ with CodeGeneration() as ctx:
     uniform_inflow_uid = 'Uniform Inflow Flag'
     loglaw_inflow_uid = 'LogLaw Inflow Flag'
     outflow_uid = 'Outflow Flag'
+    top_outflow_uid = 'TopOutflow Flag'
 
     free_slip = lbm_boundary_generator(class_name='waLBerlaABL_FreeSlip', flag_uid=symmetry_uid,
                                        boundary_object=FreeSlip(lb_method.stencil, normal_direction=(0, 0, -1)))
@@ -244,6 +277,13 @@ with CodeGeneration() as ctx:
                                      boundary_object=outflow_bc,
                                      additional_data_handler=OutflowAdditionalDataHandler(lb_method.stencil, outflow_bc, target=target))
 
+    top_outflow_bc = ExtrapolationOutflow(normal_direction=(0, 0, 1),
+                                          lb_method=lb_method, data_type=data_type,
+                                          streaming_pattern=streaming_pattern, zeroth_timestep=Timestep.EVEN)
+    top_outflow = lbm_boundary_generator(class_name='waLBerlaABL_TopOutflow', flag_uid=top_outflow_uid,
+                                         boundary_object=top_outflow_bc,
+                                         additional_data_handler=OutflowAdditionalDataHandler(lb_method.stencil, top_outflow_bc, target=target))
+
     # strain rate writer
     @ps.kernel
     def strain_rate_writer():
@@ -269,7 +309,7 @@ with CodeGeneration() as ctx:
     generate_lbm_package(ctx, name=f"{name}_",
                          collision_rule=collision_rule,
                          lbm_config=lbm_config, lbm_optimisation=lbm_optimisation,
-                         nonuniform=False, boundaries=[no_slip, free_slip, wfb, uniform_ubb, loglaw_ubb, outflow],
+                         nonuniform=False, boundaries=[no_slip, free_slip, wfb, uniform_ubb, loglaw_ubb, outflow, top_outflow],
                          macroscopic_fields=macroscopic_fields,
                          target=target, gpu_indexing_params=gpu_indexing_params, max_threads=max_threads,
                          cpu_vectorize_info=cpu_vectorise_info)
@@ -292,7 +332,8 @@ with CodeGeneration() as ctx:
         'symmetry_flag': symmetry_uid,
         'uniform_inflow_flag': uniform_inflow_uid,
         'loglaw_inflow_flag': loglaw_inflow_uid,
-        'outflow_flag': outflow_uid
+        'outflow_flag': outflow_uid,
+        'top_outflow_flag': top_outflow_uid
     }
 
     field_typedefs = {

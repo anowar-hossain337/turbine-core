@@ -15,10 +15,10 @@ waLBerla_generate_target_from_python(
         waLBerlaABL_UniformUBB.cu waLBerlaABL_UniformUBB.h
         waLBerlaABL_LogLawUBB.cu waLBerlaABL_LogLawUBB.h
         waLBerlaABL_Outflow.cu waLBerlaABL_Outflow.h
+        waLBerlaABL_TopOutflow.cu waLBerlaABL_TopOutflow.h
         waLBerlaABL_WelfordWFB.cu waLBerlaABL_WelfordWFB.h
         waLBerlaABL_WelfordOutput.cu waLBerlaABL_WelfordOutput.h
         waLBerlaABL_SoSResetter.cu waLBerlaABL_SoSResetter.h
-        waLBerlaABL_SoCResetter.cu waLBerlaABL_SoCResetter.h
         waLBerlaABL_WelfordEddyViscosity.cu waLBerlaABL_WelfordEddyViscosity.h
         waLBerlaABL_PdfSetter.cpp waLBerlaABL_PdfSetter.h
         waLBerlaABL_MacroGetter.cpp waLBerlaABL_MacroGetter.h

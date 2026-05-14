@@ -1,6 +1,11 @@
+// Reason for edit start: add the standard-library helpers needed to validate the new top-boundary option without changing the existing Open/WFB configuration flow.
+#include <algorithm>
+#include <cctype>
 #include <iostream>
 #include <cmath>
+#include <string>
 #include <vector>
+// Reason for edit end: add the standard-library helpers needed to validate the new top-boundary option without changing the existing Open/WFB configuration flow.
 
 #include <blockforest/Initialization.h>
 #include <core/all.h>
@@ -23,6 +28,10 @@
 #include "walberla_helper/field/all.h"
 #include "wind_turbine_core/ProjectDefines.h"
 
+#include "TopDampingZone.h"
+// Reason for edit start: include the top-only zero-normal-pressure-gradient helper as an app-level extension so the bottom WFB path and generated boundary package stay untouched.
+#include "TopSlipZeroGradientBoundary.h"
+// Reason for edit end: include the top-only zero-normal-pressure-gradient helper as an app-level extension so the bottom WFB path and generated boundary package stay untouched.
 #include "waLBerlaABL_KernelInfo.h"
 #include "FlowDriverCollection.h"
 
@@ -65,6 +74,32 @@ int main(int argc, char** argv) {
 
     auto boundariesConfig = globalConfig->getOneBlock("Boundaries");
     domain::BoundarySetup boundarySetup(boundariesConfig);
+    const uint_t topDampingHeight = boundariesConfig.getParameter<uint_t>("topDampingHeight", uint_t(0));
+    const real_t topDampingMaxStrength = boundariesConfig.getParameter<real_t>("topDampingMaxStrength", real_t(0));
+    const bool topDampingHorizontal = boundariesConfig.getParameter<bool>("topDampingHorizontal", true);
+    const bool topDampingVertical = boundariesConfig.getParameter<bool>("topDampingVertical", true);
+    // Reason for edit start: read and validate the new top-only zero-normal-pressure-gradient option so it can only run with setup=Open and the existing slip-like top naming.
+    const auto normalizeBoundaryOption = [](std::string value) {
+        value.erase(std::remove_if(value.begin(), value.end(),
+                                   [](unsigned char ch) { return std::isspace(ch) != 0; }),
+                    value.end());
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
+    };
+    const bool topZeroNormalPressureGradient =
+            boundariesConfig.getParameter<bool>("topZeroNormalPressureGradient", false);
+    const std::string topBoundaryTypeName =
+            normalizeBoundaryOption(boundariesConfig.getParameter<std::string>("topBoundaryType", "symmetry"));
+    const bool topBoundaryIsSlipLike =
+            topBoundaryTypeName == "symmetry" || topBoundaryTypeName == "slip" || topBoundaryTypeName == "freeslip";
+    if (topZeroNormalPressureGradient) {
+        WALBERLA_CHECK(boundarySetup.environmentSetup() == EnvironmentSetup::Open,
+                       "Boundaries::topZeroNormalPressureGradient requires Boundaries::setup = Open.");
+        WALBERLA_CHECK(topBoundaryIsSlipLike,
+                       "Boundaries::topZeroNormalPressureGradient requires Boundaries::topBoundaryType to be slip, symmetry, or freeslip.");
+    }
+    // Reason for edit end: read and validate the new top-only zero-normal-pressure-gradient option so it can only run with setup=Open and the existing slip-like top naming.
 
     domain::DomainSetup domainSetup(globalConfig, boundarySetup.periodicity());
 
@@ -86,10 +121,10 @@ int main(int argc, char** argv) {
     const BlockDataID forceFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "force field CPU", real_t(0), layout, fieldGhostLayers, allocator);
     const BlockDataID meanVelocityOutputFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "mean velocity output field CPU", real_t(0), layout, fieldGhostLayers, allocator);
     const BlockDataID meanVelocityWfbFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "mean velocity wfb field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+    const BlockDataID meanVelocityDampingFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "mean velocity damping field CPU", real_t(0), layout, fieldGhostLayers, allocator);
     const BlockDataID pdfFieldCpuID = walberla::lbm_generated::addPdfFieldToStorage(
             blocks, "pdf field CPU", storageSpec, fieldGhostLayers, layout,
             walberla::Set<walberla::SUID>::emptySet(), walberla::Set<walberla::SUID>::emptySet(), allocator);
-    const BlockDataID sumOfCubesFieldCpuID = walberla::field::addToStorage<ThirdOrderTensorField_T>(blocks, "sum of cubes field CPU", real_t(0), layout, fieldGhostLayers, allocator);
     const BlockDataID sumOfSquaresFieldCpuID = walberla::field::addToStorage<SecondOrderTensorField_T>(blocks, "sum of squares field CPU", real_t(0), layout, fieldGhostLayers, allocator);
 
     const BlockDataID densityFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "density field CPU", real_t(1), layout, fieldGhostLayers, allocator);
@@ -132,6 +167,7 @@ int main(int argc, char** argv) {
     initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(velocityFieldCpuID, setter);
     initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(meanVelocityOutputFieldCpuID, setter);
     initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(meanVelocityWfbFieldCpuID, setter);
+    initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(meanVelocityDampingFieldCpuID, setter);
 
     WALBERLA_LOG_INFO_ON_ROOT("Add GPU fields...")
 
@@ -140,9 +176,9 @@ int main(int argc, char** argv) {
     const BlockDataID forceFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>(blocks, forceFieldCpuID, "force field GPU", true);
     const BlockDataID meanVelocityOutputFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>(blocks, meanVelocityOutputFieldCpuID, "mean velocity output field GPU", true);
     const BlockDataID meanVelocityWfbFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>(blocks, meanVelocityWfbFieldCpuID, "mean velocity wfb field GPU", true);
+    const BlockDataID meanVelocityDampingFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>(blocks, meanVelocityDampingFieldCpuID, "mean velocity damping field GPU", true);
     const BlockDataID omegaFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>(blocks, omegaFieldCpuID, "omega field GPU", true);
     const BlockDataID pdfFieldGpuID = walberla::lbm_generated::addGPUPdfFieldToStorage<PdfField_T, StorageSpecification_T>(blocks, pdfFieldCpuID, storageSpec, "pdf field GPU");
-    const BlockDataID sumOfCubesFieldGpuID = walberla::gpu::addGPUFieldToStorage<ThirdOrderTensorField_T>(blocks, sumOfCubesFieldCpuID, "sum of cubes field GPU", true);
     const BlockDataID sumOfSquaresFieldGpuID = walberla::gpu::addGPUFieldToStorage<SecondOrderTensorField_T>(blocks, sumOfSquaresFieldCpuID, "sum of squares field GPU", true);
     const BlockDataID velocityFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>(blocks, velocityFieldCpuID, "velocity field GPU", true);
 
@@ -166,6 +202,7 @@ int main(int argc, char** argv) {
     }
 
     const auto& inflowVelocity = boundarySetup.inflowVelocity();
+
     auto velocityInit = boundary::velocityInit(roughnessLength, kappa, uTau);
     BoundaryCollection_T boundaryCollection(
             blocks, flagFieldID, pdfFieldGpuID, FluidFlagUID, forceFieldGpuID,
@@ -185,10 +222,14 @@ int main(int argc, char** argv) {
             real_t(0));
     auto welfordWFBLambda = [&welfordWFBSweep](walberla::IBlock * block) { welfordWFBSweep(block); };
 
+    walberla::pystencils::waLBerlaABL_WelfordWFB welfordTopDampingSweep(
+            meanVelocityDampingFieldGpuID, velocityFieldGpuID,
+            real_t(0));
+    auto welfordTopDampingLambda = [&welfordTopDampingSweep](walberla::IBlock * block) { welfordTopDampingSweep(block); };
+
         walberla::pystencils::waLBerlaABL_SoSResetter welfordOutputSosResetter(sumOfSquaresFieldGpuID);
-        walberla::pystencils::waLBerlaABL_SoCResetter welfordOutputSocResetter(sumOfCubesFieldGpuID);
         walberla::pystencils::waLBerlaABL_WelfordOutput welfordOutputSweep(
-            meanVelocityOutputFieldGpuID, sumOfCubesFieldGpuID, sumOfSquaresFieldGpuID, velocityFieldGpuID,
+            meanVelocityOutputFieldGpuID, sumOfSquaresFieldGpuID, velocityFieldGpuID,
             real_t(0));
         auto welfordOutputLambda = [&welfordOutputSweep](walberla::IBlock * block) { welfordOutputSweep(block); };
 
@@ -231,7 +272,7 @@ int main(int argc, char** argv) {
         fieldVTKOutput = walberla::vtk::createVTKOutput_BlockData(
                 *blocks,
                 "abl_gpu_uniform",
-                vtkWriteFrequency,
+            uint_t(1),
                 vtkGhostLayers,
                 false,
                 vtkBaseFolder,
@@ -265,6 +306,18 @@ int main(int argc, char** argv) {
             return;
         }
 
+        if(vtkWriteFrequency == uint_t(0)) {
+            ++vtkStepCounter;
+            return;
+        }
+
+        // Manual cadence control: only perform GPU->CPU copies and synchronization on real output steps.
+        const uint_t stepsSinceStart = vtkStepCounter - vtkStartTimestep;
+        if(stepsSinceStart % vtkWriteFrequency != uint_t(0)) {
+            ++vtkStepCounter;
+            return;
+        }
+
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, densityFieldCpuID, densityFieldGpuID);
         walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, velocityFieldCpuID, velocityFieldGpuID);
         walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, meanVelocityOutputFieldCpuID, meanVelocityOutputFieldGpuID);
@@ -272,6 +325,7 @@ int main(int argc, char** argv) {
         //walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, forceFieldCpuID, forceFieldGpuID);
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, eddyViscosityFieldCpuID, eddyViscosityFieldGpuID);
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, omegaFieldCpuID, omegaFieldGpuID);
+        // Keep synchronization for correctness: host VTK writer must see completed GPU->CPU copies.
         cudaDeviceSynchronize();
 
         fieldVTKOutput->write();
@@ -280,12 +334,60 @@ int main(int argc, char** argv) {
 // VTK output (GPU-safe): copy selected fields to CPU before writing
     walberla::wind::FlowDriverCollection flowDriver(blocks, &timeloop, globalConfig, domainSetup, forceFieldGpuID, velocityFieldGpuID, fieldGhostLayers);
     for(auto & block : *blocks) { flowDriver(&block); }
+    // Reason for edit start: construct the top-only zero-normal-pressure-gradient sweep as an opt-in app-level extension that leaves the bottom WFB logic unchanged.
+    boundary::TopSlipZeroGradientBoundary<PdfGPUField_T, GPUField_T<real_t>> topSlipZeroGradientBoundary(
+            blocks,
+            pdfFieldGpuID,
+            forceFieldGpuID,
+            domainSetup.domainSize_[2],
+            topZeroNormalPressureGradient);
+    if(topSlipZeroGradientBoundary.isEnabled()) {
+        WALBERLA_LOG_INFO_ON_ROOT("Top slip zero-gradient pressure handling enabled")
+    }
+    // Reason for edit end: construct the top-only zero-normal-pressure-gradient sweep as an opt-in app-level extension that leaves the bottom WFB logic unchanged.
+    // Reason for edit start: replace the generated top FreeSlip handling with a custom boundary sweep when the top zero-normal-pressure-gradient option is active, so the top boundary is not applied twice while all other boundary operators keep their original ordering.
+    std::function<void(walberla::IBlock *)> boundaryHandlingSweep = boundaryCollection.getSweep();
+    if(topSlipZeroGradientBoundary.isEnabled()) {
+        boundaryHandlingSweep = [&boundaryCollection](walberla::IBlock * block) {
+            boundaryCollection.waLBerlaABL_NoSlipObject->run(block);
+            boundaryCollection.waLBerlaABL_WFBObject->run(block);
+            boundaryCollection.waLBerlaABL_UniformUBBObject->run(block);
+            boundaryCollection.waLBerlaABL_LogLawUBBObject->run(block);
+            boundaryCollection.waLBerlaABL_OutflowObject->run(block);
+            boundaryCollection.waLBerlaABL_TopOutflowObject->run(block);
+        };
+        WALBERLA_LOG_INFO_ON_ROOT("Generated top FreeSlip handling disabled while top slip zero-gradient pressure handling is active")
+    }
+    // Reason for edit end: replace the generated top FreeSlip handling with a custom boundary sweep when the top zero-normal-pressure-gradient option is active, so the top boundary is not applied twice while all other boundary operators keep their original ordering.
+
+    damping::TopDampingZone topDamping(
+            blocks,
+            forceFieldGpuID,
+            velocityFieldGpuID,
+            meanVelocityDampingFieldGpuID,
+            domainSetup.domainSize_[2],
+            topDampingHeight,
+            topDampingMaxStrength,
+            topDampingHorizontal,
+            topDampingVertical);
+    if(topDamping.isEnabled()) {
+        WALBERLA_LOG_INFO_ON_ROOT("Top damping enabled: height = " << topDampingHeight
+                                  << ", maxStrength = " << topDampingMaxStrength
+                                  << ", dampHorizontal = " << topDampingHorizontal
+                                  << ", dampVertical = " << topDampingVertical)
+        for(auto & block : *blocks) { topDamping(&block); }
+    }
 
     timeloop.add() << walberla::BeforeFunction(communication->getCommunicateFunctor(), "Field communication")
                    << walberla::BeforeFunction([&boundarySetup, &shiftedPeriodicity]() {
                        if(boundarySetup.inflowType() == InflowSetup::ShiftedPeriodic) shiftedPeriodicity();
                    }, "Shifted periodicity")
-                   << walberla::Sweep(boundaryCollection.getSweep(), "Boundary handling");
+                   << walberla::Sweep(boundaryHandlingSweep, "Boundary handling");
+    // Reason for edit start: run the top-only zero-normal-pressure-gradient sweep immediately after the boundary handling sweep so it becomes the only active top treatment when the generated FreeSlip path has been skipped.
+    if(topSlipZeroGradientBoundary.isEnabled()) {
+        timeloop.add() << walberla::Sweep(topSlipZeroGradientBoundary.getSweep(), "Top slip zero-gradient pressure handling");
+    }
+    // Reason for edit end: run the top-only zero-normal-pressure-gradient sweep immediately after the boundary handling sweep so it becomes the only active top treatment when the generated FreeSlip path has been skipped.
 
     timeloop.add() << walberla::Sweep(sweepCollection.streamCollide(), "LBM stream-collide")
                    << walberla::AfterFunction(writeVTK, "VTK output");  // VTK output (GPU-safe): copy selected fields to CPU before writing
@@ -305,7 +407,6 @@ int main(int argc, char** argv) {
                                const auto src = blockIt->getData<GPUField_T<real_t>>(velocityFieldGpuID);
                                gpu::fieldCopy(dst, src);
                                welfordOutputSosResetter(blockIt.get());
-                               welfordOutputSocResetter(blockIt.get());
                            }
                        } else {
                            welfordOutputSweep.setCounter(real_t(welfordOutputSweep.getCounter() + 1));
@@ -313,7 +414,21 @@ int main(int argc, char** argv) {
                    }, "WelfordOutput counter")
                    << walberla::Sweep(welfordOutputLambda, "WelfordOutput sweep");
 
+    timeloop.add() << walberla::BeforeFunction([&]() {
+                       welfordTopDampingSweep.setCounter(real_t(welfordTopDampingSweep.getCounter() + 1));
+                   }, "WelfordTopDamping counter")
+                   << walberla::Sweep(welfordTopDampingLambda, "WelfordTopDamping sweep");
+
     timeloop.add() << walberla::Sweep(flowDriver, "Setting driving force");
+    if(topDamping.isEnabled()) {
+        timeloop.add() << walberla::Sweep(topDamping.getSweep(), "Top damping");
+    }
+
+    timeloop.addFuncAfterTimeStep(
+            walberla::makeSharedFunctor(
+                    walberla::field::makeStabilityChecker<PdfField_T, FlagField_T>(
+                            globalConfig, blocks, pdfFieldCpuID, flagFieldID, FluidFlagUID)),
+            "LBM stability check");
 
     timeloop.addFuncAfterTimeStep(walberla::timing::RemainingTimeLogger(timeloop.getNrOfTimeSteps(), remainingTimeLoggerFrequency),
                                   "Remaining time logger");

@@ -74,6 +74,11 @@ namespace turbine_core {
 
         private:
 
+            enum class TopBoundaryType {
+                Symmetry,
+                Outflow
+            };
+
             // Tunnel or Open
             EnvironmentSetup::Type setup_;
 
@@ -82,6 +87,7 @@ namespace turbine_core {
             InflowSetup::Type inflowType_;
             OutflowSetup::Type outflowType_;
             WallSetup::Type wallType_;
+            TopBoundaryType topBoundaryType_;
 
             walberla::Vector3<real_t> inflowVelocity_;
 
@@ -90,6 +96,19 @@ namespace turbine_core {
             uint_t elementLength_;
 
             walberla::Config::BlockHandle config_;
+
+            HOST_PREFIX static TopBoundaryType parseTopBoundaryType(const std::string & identifier) {
+                auto id = string::toLowercase(identifier);
+                id = string::removeSpaces(id);
+
+                if (id == "symmetry" || id == "slip" || id == "freeslip") {
+                    return TopBoundaryType::Symmetry;
+                } else if (id == "outflow" || id == "zerogradient") {
+                    return TopBoundaryType::Outflow;
+                } else {
+                    WALBERLA_ABORT("Invalid top boundary setup name (" << identifier << ").")
+                }
+            }
 
             HOST_PREFIX static void addBoundary( walberla::Config::Block & block, const std::string & dir, const std::string & flag ) {
                 auto & border = block.createBlock("Border");
@@ -116,6 +135,7 @@ namespace turbine_core {
             inflowType_ = InflowSetup::toType(config.getParameter<std::string>("inflowType"));
             outflowType_ = OutflowSetup::toType(config.getParameter<std::string>("outflowType"));
             wallType_ = WallSetup::toType(config.getParameter<std::string>("wallType"));
+              topBoundaryType_ = parseTopBoundaryType(config.getParameter<std::string>("topBoundaryType", "symmetry"));
 
             if((inflowType_ != InflowSetup::Periodic && outflowType_ == OutflowSetup::Periodic) ||
                 (inflowType_ == InflowSetup::Periodic && outflowType_ != OutflowSetup::Periodic)) {
@@ -184,7 +204,11 @@ namespace turbine_core {
                 } else {
                     WALBERLA_ABORT("Invalid wall type in Boundary Configuration")
                 }
-                addBoundary(boundaryBlock, "T", SymmetryFlagUID.getIdentifier());
+                  if (topBoundaryType_ == TopBoundaryType::Symmetry) {
+                      addBoundary(boundaryBlock, "T", SymmetryFlagUID.getIdentifier());
+                  } else {
+                      addBoundary(boundaryBlock, "T", "TopOutflow Flag");
+                  }
             } else if ( setup_ == EnvironmentSetup::Tunnel ) {
                 if( wallType_ == WallSetup::NoSlip) {
                     addBoundary(boundaryBlock, "B,T", NoSlipFlagUID.getIdentifier());
