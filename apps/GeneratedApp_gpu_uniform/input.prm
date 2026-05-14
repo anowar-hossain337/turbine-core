@@ -1,7 +1,7 @@
 DomainSetup
 {
-    domainSize    <128,32,32>;
-    // cellsPerBlock <16, 16, 16>;
+    domainSize    <40,40,50>;
+    // cellsPerBlock <40, 40, 40>;
 
     loadSnapshot    0;
     storeSnapshot   0;
@@ -17,26 +17,26 @@ DomainSetup
 
 Parameters
 {
-    timesteps          20000;
+    timesteps          937500;
 
-    length_SI             126.0;
-    length_LU              16.0;
+    length_SI             320;
+    length_LU              10;
 
-    velocity_SI            10.0;
+    velocity_SI            5;
     velocity_LU             0.05;
 
-    viscosity_SI           1.82e-05;
-    density_SI             1.22;
+    viscosity_SI           1.89e-05;
+    density_SI             1;
 
     remainingTimeLoggerFrequency 5; // in seconds
 
-    roughnessLengthRatio 1e-3;
-    referenceHeight_LU   16;
-    samplingHeight_LU    8;
+    roughnessLengthRatio 0.000625;
+    referenceHeight_LU   5;
+    samplingHeight_LU    10;
 
-    driverType          pressureGradient;
-    coriolisFrequency   -1; // given in s^-1; here: dummy value
-    geostrophicWind     <-100, -100, -100>; // given in m*s^-1, the third component should ALWAYS be 0; here: dummy value
+    driverType          coriolisForce;
+    coriolisFrequency   0.0001; // given in s^-1; here: dummy value
+    geostrophicWind     <10, 0, 0>; // given in m*s^-1, the third component should ALWAYS be 0; here: dummy value
     windDirectionDegrees 0;
     windDirectionChangeRateTable "windDirectionChange.wd";
 }
@@ -57,19 +57,11 @@ Boundaries
     outflowPressure         1.0;
 
     wallType                WFB;
-    /*
-        numberElements 20;
-        elementDistance 5;
-        elementLength 10;
 
-        Body
-        {
-            shape box;
-            min <20,0,0>;
-            max <30,48,10>;
-            flag NoSlip Flag;
-        }
-    */
+        numberElements 0;
+        elementDistance 0;
+        elementLength 0;
+
 }
 
 WindFarm{
@@ -80,7 +72,7 @@ WindFarm{
 
     Turbine1
     {
-        basePoint             <64, 16, 0>;
+        basePoint             <500, 500, 0>;
 
         diameter_LU             16.0;
 
@@ -139,10 +131,10 @@ StabilityChecker
 
 Output
 {
-    welfordInterval 100;
+    welfordInterval 187500;
     VTK
     {
-        writeFrequency 100;
+        writeFrequency 187500;
         ghostLayers    0;
 
         baseFolder           vtk_out;
