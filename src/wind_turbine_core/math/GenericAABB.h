@@ -33,7 +33,9 @@ namespace turbine_core {
                     : minCorner_(other.minCorner_), maxCorner_(other.maxCorner_)
             {}
 
-            HOST_DEVICE_PREFIX GenericAABB( const walberla::AABB & other )
+            // HOST_DEVICE_PREFIX GenericAABB( const walberla::AABB & other )
+            // This waLBerla bridge constructor reads host-side accessors, so it must stay host-only.
+            HOST_PREFIX GenericAABB( const walberla::AABB & other )
                     : minCorner_(other.minCorner().data()), maxCorner_(other.maxCorner().data())
             {}
 

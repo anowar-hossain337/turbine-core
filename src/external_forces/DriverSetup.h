@@ -88,6 +88,10 @@ namespace turbine_core {
                         return "CoriolisForce";
                 }
 
+                // Keep an explicit fallback so the compiler sees a return even if a new enum value is added later.
+                WALBERLA_ABORT("Unhandled DriverSetup type in toString().")
+                return "UnknownDriverSetup";
+
             }
 
         };

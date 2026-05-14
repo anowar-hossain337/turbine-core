@@ -72,6 +72,10 @@ namespace turbine_core {
                     return "FreeSlip";
             }
 
+            // Keep an explicit fallback so the compiler sees a return even if a new enum value is added later.
+            WALBERLA_ABORT("Unhandled EnvironmentSetup type in toString().")
+            return "UnknownEnvironmentSetup";
+
         }
 
     };
@@ -120,6 +124,10 @@ namespace turbine_core {
                     return "InflowLogLaw";
             }
 
+            // Keep an explicit fallback so the compiler sees a return even if a new enum value is added later.
+            WALBERLA_ABORT("Unhandled InflowSetup type in toString().")
+            return "UnknownInflowSetup";
+
         }
 
     };
@@ -163,6 +171,10 @@ namespace turbine_core {
                     return "Outflow";
             }
 
+            // Keep an explicit fallback so the compiler sees a return even if a new enum value is added later.
+            WALBERLA_ABORT("Unhandled OutflowSetup type in toString().")
+            return "UnknownOutflowSetup";
+
         }
 
     };
@@ -200,6 +212,10 @@ namespace turbine_core {
                 case Type::WFB :
                     return "WFB";
             }
+
+            // Keep an explicit fallback so the compiler sees a return even if a new enum value is added later.
+            WALBERLA_ABORT("Unhandled WallSetup type in toString().")
+            return "UnknownWallSetup";
 
         }
 

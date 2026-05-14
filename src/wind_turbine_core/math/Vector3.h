@@ -31,7 +31,9 @@ namespace turbine_core {
             HOST_DEVICE_PREFIX constexpr          Vector3( const Vector3 & v ) { v_[0] = v[0]; v_[1] = v[1]; v_[2] = v[2]; }
             HOST_DEVICE_PREFIX constexpr explicit Vector3( const T * v ) { v_[0] = v[0]; v_[1] = v[1]; v_[2] = v[2]; }
 
-            HOST_DEVICE_PREFIX Vector3 ( const walberla::Vector3<T> & vector )
+            // HOST_DEVICE_PREFIX Vector3 ( const walberla::Vector3<T> & vector )
+            // This waLBerla bridge constructor reads host-side accessors, so it must stay host-only.
+            HOST_PREFIX Vector3 ( const walberla::Vector3<T> & vector )
             : Vector3(vector.data())
             {}
 
