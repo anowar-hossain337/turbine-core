@@ -14,6 +14,9 @@
 #include <timeloop/all.h>
 #include <vtk/VTKOutput.h>  // VTK output (GPU-safe): copy selected fields to CPU before writing
 #include <field/vtk/VTKWriter.h>  // VTK output (GPU-safe): copy selected fields to CPU before writing
+// BEGIN EDIT: include the flag mapping writer so ParaView can receive a simple binary obstacle mask.
+#include <field/vtk/FlagFieldMapping.h>
+// END EDIT: include the flag mapping writer so ParaView can receive a simple binary obstacle mask.
 
 #include "conversion/Conversion.h"
 #include "domain/BoundaryHandling.h"
@@ -223,10 +226,18 @@ int main(int argc, char** argv) {
     const uint_t vtkWriteFrequency = vtkConfig.getParameter<uint_t>("writeFrequency", uint_t(0));
     const uint_t vtkStartTimestep = vtkConfig.getParameter<uint_t>("startTimestep", uint_t(0));
     const uint_t vtkGhostLayers = vtkConfig.getParameter<uint_t>("ghostLayers", uint_t(0));
+    // BEGIN EDIT: switch the dedicated solid-geometry output from raw flag-field naming to obstacle-mask naming.
+    const bool vtkWriteObstacleMask = vtkConfig.isDefined("writeObstacleMask");
+    const uint_t vtkRequestedObstacleMaskGhostLayers = vtkConfig.getParameter<uint_t>("writeObstacleMask", vtkGhostLayers);
+    const uint_t vtkObstacleMaskGhostLayers = std::min(vtkRequestedObstacleMaskGhostLayers, fieldGhostLayers);
+    // END EDIT: switch the dedicated solid-geometry output from raw flag-field naming to obstacle-mask naming.
     const std::string vtkBaseFolder = vtkConfig.getParameter<std::string>("baseFolder", "vtk_out");
     const std::string vtkExecutionFolder = vtkConfig.getParameter<std::string>("executionFolder", "simulation_step");
 
     std::shared_ptr<walberla::vtk::VTKOutput> fieldVTKOutput{nullptr};
+    // BEGIN EDIT: rename the dedicated VTK stream so it clearly writes the obstacle mask only.
+    std::shared_ptr<walberla::vtk::VTKOutput> obstacleMaskVTKOutput{nullptr};
+    // END EDIT: rename the dedicated VTK stream so it clearly writes the obstacle mask only.
     if(vtkWriteFrequency > 0) {
         fieldVTKOutput = walberla::vtk::createVTKOutput_BlockData(
                 *blocks,
@@ -247,16 +258,53 @@ int main(int argc, char** argv) {
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(densityFieldCpuID, "Density"));
         fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<VectorField_T>>(velocityFieldCpuID, "Velocity"));
         fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<VectorField_T>>(meanVelocityOutputFieldCpuID, "MeanVelocityOutput"));
+        fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<SecondOrderTensorField_T>>(sumOfSquaresFieldCpuID, "SumOfSquares"));
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<VectorField_T>>(forceFieldCpuID, "Force"));
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(eddyViscosityFieldCpuID, "EddyViscosity"));
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(omegaFieldCpuID, "Omega"));
-        // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<FlagField_T>>(flagFieldID, "Flag"));
+
+        // BEGIN EDIT: write obstacle-mask output under its own config key and folder name.
+        if(vtkWriteObstacleMask) {
+            if(vtkRequestedObstacleMaskGhostLayers > fieldGhostLayers) {
+                WALBERLA_LOG_WARNING_ON_ROOT(
+                        "Requested writeObstacleMask ghost layers (" << vtkRequestedObstacleMaskGhostLayers
+                        << ") exceed available flag-field ghost layers (" << fieldGhostLayers
+                        << "). Clamping obstacle-mask VTK output to " << vtkObstacleMaskGhostLayers << ".")
+            }
+            // Reason for change: the obstacle mask is derived from the CPU-side flag field, so it needs its own VTK writer
+            // instead of going through the GPU-to-CPU copy path used for the regular flow fields above.
+            obstacleMaskVTKOutput = walberla::vtk::createVTKOutput_BlockData(
+                    *blocks,
+                    "abl_gpu_uniform_obstacle_mask",
+                    vtkWriteFrequency,
+                    vtkObstacleMaskGhostLayers,
+                    false,
+                    vtkBaseFolder,
+                    vtkExecutionFolder,
+                    true,
+                    true,
+                    true,
+                    true,
+                    uint_t(0),
+                    false,
+                    false);
+
+            // BEGIN EDIT: write a binary obstacle mask so ParaView can threshold solid ship cells directly.
+            auto obstacleMaskWriter = std::make_shared<walberla::field::FlagFieldMapping<FlagField_T, walberla::uint8_t>>(flagFieldID, "ObstacleMask");
+            obstacleMaskWriter->addMapping(NoSlipFlagUID, walberla::uint8_t(1));
+            obstacleMaskWriter->addMapping(WFBFlagUID, walberla::uint8_t(1));
+            obstacleMaskVTKOutput->addCellDataWriter(obstacleMaskWriter);
+            // END EDIT: write a binary obstacle mask so ParaView can threshold solid ship cells directly.
+        }
+        // END EDIT: write obstacle-mask output under its own config key and folder name.
     }
 
     auto writeVTK = [&]() {
-        if(!fieldVTKOutput) {
+        // BEGIN EDIT: use the obstacle-mask writer as the only dedicated solid-geometry output stream.
+        if(!fieldVTKOutput && !obstacleMaskVTKOutput) {
             return;
         }
+        // END EDIT: use the obstacle-mask writer as the only dedicated solid-geometry output stream.
 
         static uint_t vtkStepCounter = uint_t(0);
         if(vtkStepCounter < vtkStartTimestep) {
@@ -264,15 +312,27 @@ int main(int argc, char** argv) {
             return;
         }
 
-        //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, densityFieldCpuID, densityFieldGpuID);
-        walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, velocityFieldCpuID, velocityFieldGpuID);
-        walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, meanVelocityOutputFieldCpuID, meanVelocityOutputFieldGpuID);
-        //walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, forceFieldCpuID, forceFieldGpuID);
-        //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, eddyViscosityFieldCpuID, eddyViscosityFieldGpuID);
-        //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, omegaFieldCpuID, omegaFieldGpuID);
-        cudaDeviceSynchronize();
+        if(fieldVTKOutput) {
+            //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, densityFieldCpuID, densityFieldGpuID);
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, velocityFieldCpuID, velocityFieldGpuID);
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, meanVelocityOutputFieldCpuID, meanVelocityOutputFieldGpuID);
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>(blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID);
 
-        fieldVTKOutput->write();
+            //walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, forceFieldCpuID, forceFieldGpuID);
+            //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, eddyViscosityFieldCpuID, eddyViscosityFieldGpuID);
+            //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, omegaFieldCpuID, omegaFieldGpuID);
+            cudaDeviceSynchronize();
+
+            fieldVTKOutput->write();
+        }
+
+        // BEGIN EDIT: keep the obstacle-mask output on the same timestep schedule as the flow-field output.
+        if(obstacleMaskVTKOutput) {
+            // Reason for change: keep the optional obstacle-mask VTK stream on the same timestep schedule
+            // as the regular VTK output while avoiding unnecessary GPU synchronization or copies.
+            obstacleMaskVTKOutput->write();
+        }
+        // END EDIT: keep the obstacle-mask output on the same timestep schedule as the flow-field output.
         ++vtkStepCounter;
     };
 // VTK output (GPU-safe): copy selected fields to CPU before writing

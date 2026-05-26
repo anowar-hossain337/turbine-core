@@ -23,10 +23,20 @@
 
 #pragma once
 
+#include <core/StringUtility.h>
 #include <core/config/Config.h>
 #include <core/logging/Logging.h>
-#include <geometry/InitBoundaryHandling.h>
 #include <field/GhostLayerField.h>
+#include <geometry/InitBoundaryHandling.h>
+// BEGIN EDIT: add waLBerla mesh headers so boundary setup can initialize STL/OBJ mesh obstacles.
+#include <mesh/boundary/BoundarySetup.h>
+#include <mesh_common/DistanceComputations.h>
+#include <mesh_common/DistanceFunction.h>
+#include <mesh_common/MeshIO.h>
+#include <mesh_common/MeshOperations.h>
+#include <mesh_common/TriangleMeshes.h>
+#include <mesh_common/distance_octree/DistanceOctree.h>
+// END EDIT: add waLBerla mesh headers so boundary setup can initialize STL/OBJ mesh obstacles.
 
 #include "wind_turbine_core/ProjectDefines.h"
 #include "wind_turbine_core/WalberlaDataTypes.h"
@@ -98,6 +108,149 @@ namespace turbine_core {
                 border.addParameter("flag", flag);
             }
 
+            // BEGIN EDIT: add helpers that preserve existing primitive geometry input while enabling mesh-based obstacles.
+            HOST_PREFIX static bool isInitializerGeometryBlock( const std::string & key ) {
+                return key == "Border" || key == "CellInterval" || key == "Body" ||
+                       key == "VoxelFile" || key == "Image" || key == "GrayScaleImage" ||
+                       key == "RGBAImage";
+            }
+
+            HOST_PREFIX static void cloneConfigBlockRecursively( const walberla::Config::BlockHandle & source,
+                                                                 walberla::Config::Block & target ) {
+                for( auto it = source.begin(); it != source.end(); ++it ) {
+                    target.setOrAddParameter( it->first, it->second );
+                }
+
+                walberla::Config::Blocks childBlocks;
+                source.getBlocks( childBlocks );
+                for( const auto & childBlock : childBlocks ) {
+                    auto & targetChild = target.createBlock( childBlock.getKey() );
+                    cloneConfigBlockRecursively( childBlock, targetChild );
+                }
+            }
+
+            HOST_PREFIX static void copySupportedGeometryBlocks( const walberla::Config::BlockHandle & source,
+                                                                 walberla::Config::Block & target ) {
+                walberla::Config::Blocks childBlocks;
+                source.getBlocks( childBlocks );
+                for( const auto & childBlock : childBlocks ) {
+                    if( !isInitializerGeometryBlock( childBlock.getKey() ) ) {
+                        continue;
+                    }
+
+                    auto & targetChild = target.createBlock( childBlock.getKey() );
+                    cloneConfigBlockRecursively( childBlock, targetChild );
+                }
+            }
+
+            template< typename FlagField_T >
+            HOST_PREFIX static uint_t getFlagFieldGhostLayers( const std::shared_ptr<walberla::StructuredBlockForest> & sbf,
+                                                               const BlockDataID & flagFieldID ) {
+                for( auto & block : *sbf ) {
+                    auto * flagField = block.template getData<FlagField_T>( flagFieldID );
+                    WALBERLA_CHECK_NOT_NULLPTR( flagField, "flagFieldID invalid!" )
+                    return flagField->nrOfGhostLayers();
+                }
+
+                WALBERLA_ABORT( "Cannot determine flag-field ghost layers because the block forest is empty." )
+                return uint_t(0);
+            }
+
+            template< typename FlagField_T >
+            HOST_PREFIX static void registerFlagOnAllBlocks( const std::shared_ptr<walberla::StructuredBlockForest> & sbf,
+                                                             const BlockDataID & flagFieldID,
+                                                             const walberla::FlagUID & flagUID ) {
+                for( auto & block : *sbf ) {
+                    auto * flagField = block.template getData<FlagField_T>( flagFieldID );
+                    WALBERLA_CHECK_NOT_NULLPTR( flagField, "flagFieldID invalid!" )
+                    flagField->getOrRegisterFlag( flagUID );
+                }
+            }
+
+            HOST_PREFIX static bool matchesFlagName( const std::string & requestedFlag,
+                                                     const walberla::FlagUID & flagUID,
+                                                     const std::string & alias ) {
+                return walberla::string_icompare( requestedFlag, alias ) == 0 ||
+                       walberla::string_icompare( requestedFlag, flagUID.getIdentifier() ) == 0;
+            }
+
+            HOST_PREFIX static const walberla::FlagUID & resolveMeshBoundaryFlag( const std::string & requestedFlag,
+                                                                                  const walberla::FlagUID & NoSlipFlagUID,
+                                                                                  const walberla::FlagUID & WFBFlagUID,
+                                                                                  const walberla::FlagUID & SymmetryFlagUID,
+                                                                                  const walberla::FlagUID & UniformInflowFlagUID,
+                                                                                  const walberla::FlagUID & LogLawInflowFlagUID,
+                                                                                  const walberla::FlagUID & OutflowFlagUID ) {
+                if( matchesFlagName( requestedFlag, NoSlipFlagUID, "NoSlip" ) ) return NoSlipFlagUID;
+                if( matchesFlagName( requestedFlag, WFBFlagUID, "WFB" ) ) return WFBFlagUID;
+                if( matchesFlagName( requestedFlag, SymmetryFlagUID, "Symmetry" ) ) return SymmetryFlagUID;
+                if( matchesFlagName( requestedFlag, UniformInflowFlagUID, "UniformInflow" ) ) return UniformInflowFlagUID;
+                if( matchesFlagName( requestedFlag, LogLawInflowFlagUID, "LogLawInflow" ) ) return LogLawInflowFlagUID;
+                if( matchesFlagName( requestedFlag, OutflowFlagUID, "Outflow" ) ) return OutflowFlagUID;
+
+                WALBERLA_ABORT( "Unsupported mesh boundary flag '" << requestedFlag
+                                << "'. Use one of: NoSlip, WFB, Symmetry, UniformInflow, LogLawInflow, Outflow, "
+                                << "or the full generated flag identifiers." )
+                return NoSlipFlagUID;
+            }
+
+            template< typename FlagField_T >
+            HOST_PREFIX static void applyMeshObject( const std::shared_ptr<walberla::StructuredBlockForest> & sbf,
+                                                     const BlockDataID & flagFieldID,
+                                                     const walberla::Config::BlockHandle & meshBlock,
+                                                     const walberla::FlagUID & NoSlipFlagUID,
+                                                     const walberla::FlagUID & WFBFlagUID,
+                                                     const walberla::FlagUID & SymmetryFlagUID,
+                                                     const walberla::FlagUID & UniformInflowFlagUID,
+                                                     const walberla::FlagUID & LogLawInflowFlagUID,
+                                                     const walberla::FlagUID & OutflowFlagUID ) {
+                using Mesh_T = walberla::mesh::TriangleMesh;
+
+                const std::string meshFile = meshBlock.isDefined( "file" )
+                                             ? meshBlock.getParameter<std::string>( "file" )
+                                             : meshBlock.getParameter<std::string>( "meshFile" );
+                const bool binaryFile = meshBlock.getParameter<bool>( "binary", false );
+                const std::string requestedFlag = meshBlock.getParameter<std::string>( "flag", "NoSlip" );
+                // BEGIN EDIT: explicitly unwrap config parameters into concrete Vector3 values so NVCC does not route through the wrong Vector3 constructor.
+                auto scaleParameter = meshBlock.getParameter<walberla::Vector3<real_t>>(
+                        "scale", walberla::Vector3<real_t>( real_t(1) ) );
+                const walberla::Vector3<real_t> scale = scaleParameter.operator walberla::Vector3<real_t>();
+
+                auto offsetParameter = meshBlock.isDefined( "offset" )
+                                       ? meshBlock.getParameter<walberla::Vector3<real_t>>( "offset" )
+                                       : meshBlock.getParameter<walberla::Vector3<real_t>>(
+                                               "translation", walberla::Vector3<real_t>( real_t(0) ) );
+                const walberla::Vector3<real_t> offset = offsetParameter.operator walberla::Vector3<real_t>();
+                // END EDIT: explicitly unwrap config parameters into concrete Vector3 values so NVCC does not route through the wrong Vector3 constructor.
+
+                auto mesh = std::make_shared<Mesh_T>();
+                walberla::mesh::readAndBroadcast( meshFile, *mesh, binaryFile );
+                walberla::mesh::scale( *mesh, scale );
+                walberla::mesh::translate( *mesh, offset );
+
+                const auto meshBounds = walberla::mesh::computeAABB( *mesh );
+                const auto & meshFlagUID = resolveMeshBoundaryFlag( requestedFlag, NoSlipFlagUID, WFBFlagUID,
+                                                                    SymmetryFlagUID, UniformInflowFlagUID,
+                                                                    LogLawInflowFlagUID, OutflowFlagUID );
+
+                WALBERLA_LOG_INFO_ON_ROOT( "Applying mesh obstacle from '" << meshFile << "' with flag '"
+                                           << meshFlagUID.getIdentifier() << "', scale " << scale
+                                           << ", offset " << offset << ", bounds " << meshBounds )
+
+                auto triDistance = std::make_shared<walberla::mesh::TriangleDistance<Mesh_T>>( mesh );
+                auto distanceOctree = std::make_shared<walberla::mesh::DistanceOctree<Mesh_T>>( triDistance );
+
+                registerFlagOnAllBlocks<FlagField_T>( sbf, flagFieldID, meshFlagUID );
+
+                walberla::mesh::BoundarySetup meshBoundarySetup(
+                        sbf,
+                        walberla::makeMeshDistanceFunction( distanceOctree ),
+                        getFlagFieldGhostLayers<FlagField_T>( sbf, flagFieldID ) );
+                meshBoundarySetup.template setFlag<FlagField_T>(
+                        flagFieldID, meshFlagUID, walberla::mesh::BoundarySetup::INSIDE );
+            }
+            // END EDIT: add helpers that preserve existing primitive geometry input while enabling mesh-based obstacles.
+
         };
 
         HOST_PREFIX BoundarySetup::BoundarySetup(const walberla::Config::BlockHandle &config) {
@@ -163,8 +316,9 @@ namespace turbine_core {
                                                                  const walberla::FlagUID & OutflowFlagUID ) const {
 
 
-            // setup config
-            walberla::Config::Block boundaryBlock = config_.cloneBlock();
+            // BEGIN EDIT: filter primitive geometry through the existing initializer and then overlay optional mesh obstacles.
+            walberla::Config::Block boundaryBlock( config_.getKey() );
+            copySupportedGeometryBlocks( config_, boundaryBlock );
 
             if( inflowType_ == InflowSetup::InflowUniform ) {
                 addBoundary(boundaryBlock, "W", UniformInflowFlagUID.getIdentifier());
@@ -233,7 +387,21 @@ namespace turbine_core {
             walberla::Config::BlockHandle boundariesConfig(&boundaryBlock);
             walberla::geometry::initBoundaryHandling< FlagField_T >( *sbf, flagFieldID, boundariesConfig );
 
+            walberla::Config::Blocks meshBlocks;
+            config_.getBlocks( "MeshObject", meshBlocks );
+
+            walberla::Config::Blocks stlBlocks;
+            config_.getBlocks( "STLObject", stlBlocks );
+            meshBlocks.insert( meshBlocks.end(), stlBlocks.begin(), stlBlocks.end() );
+
+            for( const auto & meshBlock : meshBlocks ) {
+                applyMeshObject<FlagField_T>( sbf, flagFieldID, meshBlock, NoSlipFlagUID, WFBFlagUID,
+                                              SymmetryFlagUID, UniformInflowFlagUID,
+                                              LogLawInflowFlagUID, OutflowFlagUID );
+            }
+
             walberla::geometry::setNonBoundaryCellsToDomain<FlagField_T>(*sbf, flagFieldID, FluidFlagUID);
+            // END EDIT: filter primitive geometry through the existing initializer and then overlay optional mesh obstacles.
         }
 
         HOST_PREFIX std::ostream &operator<<(std::ostream &os, const BoundarySetup &setup) {

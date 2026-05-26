@@ -8,6 +8,9 @@ target_link_libraries( domain
         walberla::field
         walberla::geometry
         walberla::lbm
+        # BEGIN EDIT: link the waLBerla mesh module so BoundarySetup can load and voxelize STL/OBJ obstacles.
+        walberla::mesh
+        # END EDIT: link the waLBerla mesh module so BoundarySetup can load and voxelize STL/OBJ obstacles.
         walberla::vtk
         domain-refinement
         wind_turbine_core
