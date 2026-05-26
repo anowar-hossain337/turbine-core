@@ -214,20 +214,42 @@ namespace turbine_core {
                 auto initialVel = frictionVelocity_ / kappa_ * (std::log( pos / roughnessLength_ ));
 
                 walberla::Vector3<real_t> vel;
-                vel[flowAxis] = initialVel;
+                //vel[flowAxis] = initialVel;
+                // --- NIST-style perturbation ---
+                // Near-wall envelope: z/H * exp(-sigma * (z/H)^2)
+                const real_t sigmaN = real_t(36);
+                const real_t envelope = rel_z * std::exp(-sigmaN * rel_z * rel_z);
 
+                // Small amplitude (≈ few % of mean flow)
+                const real_t C = real_t(0.35) * frictionVelocity_ / kappa_;
+
+                // Add perturbation to streamwise (u)
+                vel[flowAxis] = initialVel +
+                C * envelope *
+                sin(walberla::math::pi * real_t(2.0) * rel_y);
+
+                // Spanwise perturbation (v)
                 if(usePerturbations_) {
-                    vel[remAxis] = real_t(2.0) * frictionVelocity_ / kappa_ * sin(walberla::math::pi * real_t(16.0) * rel_x) * sin(walberla::math::pi * real_t(8.0) * rel_z) /
-                                   (pow(rel_z, real_t(2.0)) + real_t(1.0));
-
-                    vel[wallAxis] = real_t(8.0) * frictionVelocity_ / kappa_ *
-                                    (sin(walberla::math::pi * real_t(8.0) * rel_y) * sin(walberla::math::pi * real_t(8.0) * rel_z) + sin(walberla::math::pi * real_t(8.0) * rel_x)) /
-                                    (pow(real_t(0.5) * delta - pos, real_t(2.0)) + real_t(1.0));
+                vel[remAxis] = C * envelope *
+                cos(walberla::math::pi * real_t(2.0) * rel_x);
                 } else {
-                    vel[remAxis] = real_t(0.0);
-
-                    vel[wallAxis] = real_t(0.0);
+                vel[remAxis] = real_t(0.0);
                 }
+
+                // NO vertical perturbation (important!)
+                vel[wallAxis] = real_t(0.0);
+                // if(usePerturbations_) {
+                //    vel[remAxis] = real_t(2.0) * frictionVelocity_ / kappa_ * sin(walberla::math::pi * real_t(16.0) * rel_x) * sin(walberla::math::pi * real_t(8.0) * rel_z) /
+                //                   (pow(rel_z, real_t(2.0)) + real_t(1.0));
+
+                //    vel[wallAxis] = real_t(8.0) * frictionVelocity_ / kappa_ *
+                //                    (sin(walberla::math::pi * real_t(8.0) * rel_y) * sin(walberla::math::pi * real_t(8.0) * rel_z) + sin(walberla::math::pi * real_t(8.0) * rel_x)) /
+                 //                   (pow(real_t(0.5) * delta - pos, real_t(2.0)) + real_t(1.0));
+                // } else {
+                //    vel[remAxis] = real_t(0.0);
+
+                //    vel[wallAxis] = real_t(0.0);
+                //}
 
                 return vel;
             }

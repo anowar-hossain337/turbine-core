@@ -1,6 +1,6 @@
 DomainSetup
 {
-    domainSize    <128, 128, 160>;
+    domainSize    <80, 80, 96>;
     cellsPerBlock <16, 16, 16>;
 
     loadSnapshot    0;
@@ -21,7 +21,7 @@ DomainSetup
             global {
                 layer1 {
                     min <0,0,0>;
-                    max <128,128,150>;
+                    max <80,80,96>;
                     level 1;
                 }
             }
@@ -33,10 +33,10 @@ DomainSetup
 
 Parameters
 {
-    timesteps          1500;
+    timesteps          1875000;
 
-    length_SI             160;
-    length_LU              16.0;
+    length_SI             320;
+    length_LU              20;
 
     velocity_SI            5;
     velocity_LU             0.05;
@@ -47,7 +47,7 @@ Parameters
     remainingTimeLoggerFrequency 5; // in seconds
 
     roughnessLengthRatio 0.000625;
-    referenceHeight_LU   16;
+    referenceHeight_LU   10;
     samplingHeight_LU    8;
 
     driverType          coriolisForce; //none, pressureGradient, dynamicPressureGradient, coriolisForce
@@ -59,24 +59,32 @@ Parameters
 
 Initialisation {
     type asmuth; // logLaw; // uniform;
-    initialVelocity <0.075, 0, 0>; //Used to calculate friction velocity 
+    initialVelocity <0.0736, 0, 0>; //Used to calculate friction velocity 
 } 
 
 Boundaries
 {
     setup                   Open;
 
-    inflowType              logLawInflow; // periodic, shiftedPeriodic, logLawInflow, uniformInflow
-    outflowType             Outflow;
+    inflowType              periodic; // periodic, shiftedPeriodic, logLawInflow, uniformInflow
+    outflowType             periodic;
 
     inflowVelocity          <0.05, 0, 0>; // Only applicable if inflowType is set uniformInflow
     outflowPressure         1.0; //not used in this application
 
-    wallType                WFB;
+    wallType                WFB; //WFB , NoSlip
 
     numberElements 0;
     elementDistance 0;
     elementLength 0;
+
+        Body
+        {
+            shape ;
+            min <20,0,0>;
+            max <30,48,10>;
+            flag NoSlip Flag;
+        }
 
     
 }
@@ -90,10 +98,10 @@ StabilityChecker
 
 Output
 {
-    welfordInterval 100;
+    welfordInterval 375000;
     VTK
     {
-        writeFrequency 100;
+        writeFrequency 375000;
         ghostLayers    0;
 
         baseFolder           vtk_out;
