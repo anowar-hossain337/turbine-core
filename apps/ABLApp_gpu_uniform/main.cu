@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <map>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@
 #include <timeloop/all.h>
 #include <vtk/VTKOutput.h>  // VTK output (GPU-safe): copy selected fields to CPU before writing
 #include <field/vtk/VTKWriter.h>  // VTK output (GPU-safe): copy selected fields to CPU before writing
+#include "output/LineOutput.h"
 
 #include "conversion/Conversion.h"
 #include "domain/BoundaryHandling.h"
@@ -41,6 +43,12 @@ static const uint_t fieldGhostLayers = 1;
 
 template<typename Type_T>
 using GPUField_T = walberla::gpu::GPUField<Type_T>;
+
+// Reason for edit start: define the optional line-output helper once so prm-driven probe lines can be enabled while keeping the existing hardcoded VTK writer untouched.
+using LineOutput_T = output::LineOutput<
+        ScalarField_T, VectorField_T, PdfGPUField_T, GPUField_T<real_t>, Stencil_T,
+        StorageSpecification_T::zeroCenteredPDFs, StorageSpecification_T::compressible>;
+// Reason for edit end: define the optional line-output helper once so prm-driven probe lines can be enabled while keeping the existing hardcoded VTK writer untouched.
 
 int main(int argc, char** argv) {
 
@@ -181,6 +189,16 @@ int main(int argc, char** argv) {
     const BlockDataID pdfFieldGpuID = walberla::lbm_generated::addGPUPdfFieldToStorage<PdfField_T, StorageSpecification_T>(blocks, pdfFieldCpuID, storageSpec, "pdf field GPU");
     const BlockDataID sumOfSquaresFieldGpuID = walberla::gpu::addGPUFieldToStorage<SecondOrderTensorField_T>(blocks, sumOfSquaresFieldCpuID, "sum of squares field GPU", true);
     const BlockDataID velocityFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>(blocks, velocityFieldCpuID, "velocity field GPU", true);
+    // Reason for edit start: collect the GPU-backed scalar and vector fields that can be sampled by prm-defined line outputs without needing extra CPU copies.
+    std::map<output::Fields::Types, BlockDataID> lineOutputFieldMap{};
+    lineOutputFieldMap[output::Fields::DENSITY] = densityFieldGpuID;
+    lineOutputFieldMap[output::Fields::VELOCITY] = velocityFieldGpuID;
+    lineOutputFieldMap[output::Fields::MEAN_VELOCITY_WFB] = meanVelocityWfbFieldGpuID;
+    lineOutputFieldMap[output::Fields::MEAN_VELOCITY_OUTPUT] = meanVelocityOutputFieldGpuID;
+    lineOutputFieldMap[output::Fields::FORCE] = forceFieldGpuID;
+    lineOutputFieldMap[output::Fields::OMEGA] = omegaFieldGpuID;
+    lineOutputFieldMap[output::Fields::EDDY_VISCOSITY] = eddyViscosityFieldGpuID;
+    // Reason for edit end: collect the GPU-backed scalar and vector fields that can be sampled by prm-defined line outputs without needing extra CPU copies.
 
     SweepCollection_T sweepCollection(blocks, densityFieldGpuID, eddyViscosityFieldGpuID, forceFieldGpuID, omegaFieldGpuID,
                                       pdfFieldGpuID, velocityFieldGpuID, omega);
@@ -331,6 +349,19 @@ int main(int argc, char** argv) {
         fieldVTKOutput->write();
         ++vtkStepCounter;
     };
+    // Reason for edit start: instantiate the optional line-output helper so prm-defined probe lines can run beside or instead of VTK output without changing the existing hardcoded writer flow.
+    std::shared_ptr<LineOutput_T> lineOutput{nullptr};
+    if(outputConfig.getNumBlocks("LineOutput")) {
+        WALBERLA_LOG_INFO_ON_ROOT("ABLApp_gpu_uniform line output enabled")
+        lineOutput = std::make_shared<LineOutput_T>(outputConfig, blocks, &timeloop, lineOutputFieldMap);
+    }
+    auto writeLineOutput = [&]() {
+        if(!lineOutput) {
+            return;
+        }
+        lineOutput->write();
+    };
+    // Reason for edit end: instantiate the optional line-output helper so prm-defined probe lines can run beside or instead of VTK output without changing the existing hardcoded writer flow.
 // VTK output (GPU-safe): copy selected fields to CPU before writing
     walberla::wind::FlowDriverCollection flowDriver(blocks, &timeloop, globalConfig, domainSetup, forceFieldGpuID, velocityFieldGpuID, fieldGhostLayers);
     for(auto & block : *blocks) { flowDriver(&block); }
@@ -390,7 +421,8 @@ int main(int argc, char** argv) {
     // Reason for edit end: run the top-only zero-normal-pressure-gradient sweep immediately after the boundary handling sweep so it becomes the only active top treatment when the generated FreeSlip path has been skipped.
 
     timeloop.add() << walberla::Sweep(sweepCollection.streamCollide(), "LBM stream-collide")
-                   << walberla::AfterFunction(writeVTK, "VTK output");  // VTK output (GPU-safe): copy selected fields to CPU before writing
+                   << walberla::AfterFunction(writeVTK, "VTK output")
+                   << walberla::AfterFunction(writeLineOutput, "Line output");
 
     if(boundarySetup.wallType() == WallSetup::WFB) {
         timeloop.add() << walberla::BeforeFunction([&]() {

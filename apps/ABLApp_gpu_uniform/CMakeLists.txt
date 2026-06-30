@@ -31,9 +31,11 @@ waLBerla_generate_target_from_python(
 waLBerla_add_executable(
         NAME ABLApp_gpu_uniform
         FILES main.cu
+        # Reason for edit start: link the shared output helper library so ABLApp_gpu_uniform can reuse prm-driven line-output support while keeping its existing hardcoded VTK writer.
         DEPENDS walberla::core walberla::blockforest walberla::domain_decomposition walberla::field walberla::lbm
-                walberla::timeloop walberla::gpu
+                walberla::timeloop walberla::gpu walberla::output
                 ABLApp_gpu_uniform_Generation
                 domain component
                 wind_turbine_core
+        # Reason for edit end: link the shared output helper library so ABLApp_gpu_uniform can reuse prm-driven line-output support while keeping its existing hardcoded VTK writer.
 )

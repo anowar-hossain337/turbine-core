@@ -107,7 +107,25 @@ Output
             Velocity;
         }
 
-        writeFlagField 4;
+        writeFlagField 1;
         writeDomainDecomposition;
+    }
+
+        LineOutput
+    {
+        Line
+        {
+            start      <800, 180, 0>;
+            end        <800, 180, 50>;
+            resolution 3;
+        }
+
+        Fields
+        {
+            Velocity;
+        }
+
+        outputFrequency  5;
+        startingTimeStep 26950;
     }
 }
