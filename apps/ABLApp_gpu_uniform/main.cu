@@ -20,7 +20,18 @@
 #include <timeloop/all.h>
 #include <vtk/VTKOutput.h>  // VTK output (GPU-safe): copy selected fields to CPU before writing
 #include <field/vtk/VTKWriter.h>  // VTK output (GPU-safe): copy selected fields to CPU before writing
+// Reason for edit start: include the reusable filter and line-output helpers so prm-driven plane-filtered VTK and optional line sampling can be enabled without removing the existing hardcoded writer path.
+#include <field/vtk/FlagFieldCellFilter.h>
+#include <vtk/AABBCellFilter.h>
+#include <vtk/ChainedFilter.h>
+#include "wind_turbine_core/WalberlaDataTypes.h"
+#include "walberla_helper/field/Field.h"
 #include "output/LineOutput.h"
+#include "output/PlaneInclusionFilter.h"
+// Reason for edit end: include the reusable filter and line-output helpers so prm-driven plane-filtered VTK and optional line sampling can be enabled without removing the existing hardcoded writer path.
+// Reason for edit start: include an app-local dynamic AABB filter so VTK inclusion boxes can move or grow without changing waLBerla's stock AABB filter.
+#include "DynamicAABBInclusionFilter.h"
+// Reason for edit end: include an app-local dynamic AABB filter so VTK inclusion boxes can move or grow without changing waLBerla's stock AABB filter.
 
 #include "conversion/Conversion.h"
 #include "domain/BoundaryHandling.h"
@@ -311,7 +322,230 @@ int main(int argc, char** argv) {
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(eddyViscosityFieldCpuID, "EddyViscosity"));
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(omegaFieldCpuID, "Omega"));
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<FlagField_T>>(flagFieldID, "Flag"));
+        // Reason for edit start: parse GeneratedApp-style inclusion filters from the prm file and attach them to the existing hardcoded writer so users can switch between whole-domain and filtered VTK output without losing the current default behavior.
+        auto addDomainFilter = [&](walberla::vtk::ChainedFilter * chainedFilter = nullptr) {
+            walberla::field::FlagFieldCellFilter<FlagField_T> fluidFilter(flagFieldID);
+            fluidFilter.addFlag(FluidFlagUID);
+            if(chainedFilter != nullptr) {
+                chainedFilter->addFilter(fluidFilter);
+            } else {
+                fieldVTKOutput->addCellInclusionFilter(fluidFilter);
+            }
+        };
+        auto addAABBFilters = [&](const walberla::Config::BlockHandle & filterConfig,
+                                  walberla::vtk::ChainedFilter * chainedFilter = nullptr) {
+            std::vector<walberla::Config::BlockHandle> aabbFilterBlocks;
+            filterConfig.getBlocks("AABB", aabbFilterBlocks);
+            for(const auto & filter : aabbFilterBlocks) {
+                const walberla::Vector3<real_t> min = filter.getParameter<walberla::Vector3<real_t>>("min");
+                const walberla::Vector3<real_t> max = filter.getParameter<walberla::Vector3<real_t>>("max");
+                // auto min_local = min;
+                // auto max_local = max;
+                // min_local[0] += 0;  //test
+                // max_local[0] += 0;   //test
+                walberla::vtk::AABBCellFilter aabbFilter({min, max}); 
+                // walberla::vtk::AABBCellFilter aabbFilter({min_local, max_local}); // commented for trying dynamic min max
+                if(chainedFilter != nullptr) {
+                    chainedFilter->addFilter(aabbFilter);
+                } else {
+                    fieldVTKOutput->addCellInclusionFilter(aabbFilter);
+                }
+            }
+        };
+        // Reason for edit start: parse a version-1 DynamicAABB prm block into shared-state filters driven by piecewise-linear center/size keyframes with domain clamping.
+        auto addDynamicAABBFilters = [&](const walberla::Config::BlockHandle & filterConfig,
+                                         walberla::vtk::ChainedFilter * chainedFilter = nullptr) {
+            std::vector<walberla::Config::BlockHandle> dynamicAABBFilterBlocks;
+            filterConfig.getBlocks("DynamicAABB", dynamicAABBFilterBlocks);
+            for(const auto & filter : dynamicAABBFilterBlocks) {
+                const std::string trajectoryType =
+                        normalizeBoundaryOption(filter.getParameter<std::string>("trajectoryType", "piecewise_linear"));
+                const std::string limitMode =
+                        normalizeBoundaryOption(filter.getParameter<std::string>("limitMode", "clamp"));
+                WALBERLA_CHECK(trajectoryType == "piecewise_linear",
+                               "DynamicAABB currently supports only trajectoryType = piecewise_linear.");
+                WALBERLA_CHECK(limitMode == "clamp",
+                               "DynamicAABB currently supports only limitMode = clamp.");
+
+                const walberla::Vector3<real_t> center0 =
+                        filter.getParameter<walberla::Vector3<real_t>>("center0");
+                const walberla::Vector3<real_t> size0 =
+                        filter.getParameter<walberla::Vector3<real_t>>("size0");
+
+                for(uint_t d = 0; d < uint_t(3); ++d) {
+                    WALBERLA_CHECK_GREATER(size0[d], real_t(0),
+                                           "DynamicAABB size0 components must be positive.");
+                }
+
+                auto min0 = center0;
+                auto max0 = center0;
+                for(uint_t d = 0; d < uint_t(3); ++d) {
+                    const real_t halfSize = real_t(0.5) * size0[d];
+                    min0[d] -= halfSize;
+                    max0[d] += halfSize;
+                }
+
+                auto state = std::make_shared<output::DynamicAABBInclusionFilter::State>(min0, max0);
+
+                DynamicAABBMotion motion{ state, {}, true };
+                motion.keyframes.push_back(DynamicAABBKeyframe{ uint_t(0), center0, size0 });
+
+                std::vector<walberla::Config::BlockHandle> pointBlocks;
+                filter.getBlocks("point", pointBlocks);
+                std::sort(pointBlocks.begin(), pointBlocks.end(),
+                          [](const walberla::Config::BlockHandle & lhs, const walberla::Config::BlockHandle & rhs) {
+                              return lhs.getParameter<uint_t>("step") < rhs.getParameter<uint_t>("step");
+                          });
+
+                auto currentSize = size0;
+                for(const auto & point : pointBlocks) {
+                    const uint_t step = point.getParameter<uint_t>("step");
+                    const walberla::Vector3<real_t> center =
+                            point.getParameter<walberla::Vector3<real_t>>("center");
+                    if(point.isDefined("size")) {
+                        currentSize = point.getParameter<walberla::Vector3<real_t>>("size");
+                        for(uint_t d = 0; d < uint_t(3); ++d) {
+                            WALBERLA_CHECK_GREATER(currentSize[d], real_t(0),
+                                                   "DynamicAABB point size components must be positive.");
+                        }
+                    }
+
+                    DynamicAABBKeyframe keyframe{ step, center, currentSize };
+                    if(step == motion.keyframes.back().step) {
+                        motion.keyframes.back() = keyframe;
+                    } else {
+                        motion.keyframes.push_back(keyframe);
+                    }
+                }
+
+                dynamicAABBMotions.push_back(motion);
+
+                output::DynamicAABBInclusionFilter dynamicAABBFilter(state);
+                if(chainedFilter != nullptr) {
+                    chainedFilter->addFilter(dynamicAABBFilter);
+                } else {
+                    fieldVTKOutput->addCellInclusionFilter(dynamicAABBFilter);
+                }
+            }
+        };
+        // Reason for edit end: parse a version-1 DynamicAABB prm block into shared-state filters driven by piecewise-linear center/size keyframes with domain clamping.
+        auto addPlaneFilters = [&](const walberla::Config::BlockHandle & filterConfig,
+                                   walberla::vtk::ChainedFilter * chainedFilter = nullptr) {
+            std::vector<walberla::Config::BlockHandle> planeFilterBlocks;
+            filterConfig.getBlocks("Plane", planeFilterBlocks);
+            for(const auto & filter : planeFilterBlocks) {
+                const walberla::Vector3<real_t> point = filter.getParameter<walberla::Vector3<real_t>>("point");
+                const walberla::Vector3<real_t> normal = filter.getParameter<walberla::Vector3<real_t>>("normal");
+                const real_t maxDistance = filter.getParameter<real_t>("maxDistance", real_t(0.5));
+                output::PlaneInclusionFilter planeFilter(point, normal, maxDistance);
+                if(chainedFilter != nullptr) {
+                    chainedFilter->addFilter(planeFilter);
+                } else {
+                    fieldVTKOutput->addCellInclusionFilter(planeFilter);
+                }
+            }
+        };
+        if(vtkConfig.getNumBlocks("inclusion_filters")) {
+            WALBERLA_LOG_INFO_ON_ROOT("ABLApp_gpu_uniform VTK inclusion filters enabled")
+            auto inclusionBlock = vtkConfig.getOneBlock("inclusion_filters");
+            if(inclusionBlock.isDefined("DomainFilter")) {
+                addDomainFilter();
+            }
+            if(inclusionBlock.getNumBlocks("AABB")) {
+                addAABBFilters(inclusionBlock);
+            }
+            if(inclusionBlock.getNumBlocks("DynamicAABB")) {
+                addDynamicAABBFilters(inclusionBlock);
+            }
+            if(inclusionBlock.getNumBlocks("Plane")) {
+                addPlaneFilters(inclusionBlock);
+            }
+            std::vector<walberla::Config::BlockHandle> combineFilterBlocks;
+            inclusionBlock.getBlocks("combine", combineFilterBlocks);
+            for(const auto & combineFilter : combineFilterBlocks) {
+                walberla::vtk::ChainedFilter chainedFilter{};
+                if(combineFilter.isDefined("DomainFilter")) {
+                    addDomainFilter(&chainedFilter);
+                }
+                if(combineFilter.getNumBlocks("AABB")) {
+                    addAABBFilters(combineFilter, &chainedFilter);
+                }
+                if(combineFilter.getNumBlocks("DynamicAABB")) {
+                    addDynamicAABBFilters(combineFilter, &chainedFilter);
+                }
+                if(combineFilter.getNumBlocks("Plane")) {
+                    addPlaneFilters(combineFilter, &chainedFilter);
+                }
+                fieldVTKOutput->addCellInclusionFilter(chainedFilter);
+            }
+        }
+        // Reason for edit end: parse GeneratedApp-style inclusion filters from the prm file and attach them to the existing hardcoded writer so users can switch between whole-domain and filtered VTK output without losing the current default behavior.
     }
+
+    // Reason for edit start: evaluate version-1 DynamicAABB piecewise-linear trajectories each timestep and clamp the resulting window to the simulation domain.
+    auto updateDynamicAABBFilters = [&]() {
+        if(dynamicAABBMotions.empty()) {
+            return;
+        }
+
+        static uint_t dynamicAABBStepCounter = uint_t(0);
+        const walberla::AABB & domainAABB = blocks->getDomain();
+
+        for(auto & motion : dynamicAABBMotions) {
+            WALBERLA_CHECK(!motion.keyframes.empty(), "DynamicAABB requires at least one keyframe.");
+
+            walberla::Vector3<real_t> center = motion.keyframes.back().center;
+            walberla::Vector3<real_t> size = motion.keyframes.back().size;
+
+            const auto upper = std::lower_bound(
+                    motion.keyframes.begin(), motion.keyframes.end(), dynamicAABBStepCounter,
+                    [](const DynamicAABBKeyframe & keyframe, const uint_t step) { return keyframe.step < step; });
+
+            if(upper == motion.keyframes.begin()) {
+                center = upper->center;
+                size = upper->size;
+            } else if(upper != motion.keyframes.end()) {
+                if(upper->step == dynamicAABBStepCounter) {
+                    center = upper->center;
+                    size = upper->size;
+                } else {
+                    const auto & lower = *(upper - 1);
+                    const real_t intervalLength = real_t(upper->step - lower.step);
+                    const real_t alpha =
+                            intervalLength > real_t(0)
+                            ? real_t(dynamicAABBStepCounter - lower.step) / intervalLength
+                            : real_t(0);
+                    for(uint_t d = 0; d < uint_t(3); ++d) {
+                        center[d] = lower.center[d] + alpha * (upper->center[d] - lower.center[d]);
+                        size[d] = lower.size[d] + alpha * (upper->size[d] - lower.size[d]);
+                    }
+                }
+            }
+
+            for(uint_t d = 0; d < uint_t(3); ++d) {
+                WALBERLA_CHECK_GREATER(size[d], real_t(0),
+                                       "DynamicAABB interpolated size components must stay positive.");
+                const real_t domainExtent = domainAABB.max(d) - domainAABB.min(d);
+                if(motion.clampToDomain) {
+                    size[d] = std::min(size[d], domainExtent);
+                    const real_t halfSize = real_t(0.5) * size[d];
+                    center[d] = std::clamp(center[d], domainAABB.min(d) + halfSize, domainAABB.max(d) - halfSize);
+                }
+            }
+
+            auto min = center;
+            auto max = center;
+            for(uint_t d = 0; d < uint_t(3); ++d) {
+                const real_t halfSize = real_t(0.5) * size[d];
+                min[d] -= halfSize;
+                max[d] += halfSize;
+            }
+            motion.state->setBounds(min, max);
+        }
+
+        ++dynamicAABBStepCounter;
+    };
+    // Reason for edit end: evaluate version-1 DynamicAABB piecewise-linear trajectories each timestep and clamp the resulting window to the simulation domain.
 
     auto writeVTK = [&]() {
         if(!fieldVTKOutput) {
