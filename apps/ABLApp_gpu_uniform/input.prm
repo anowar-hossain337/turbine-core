@@ -71,27 +71,71 @@ Boundaries
     elementDistance 0;
     elementLength 0;
 
-
+Body
+{
+    shape box;
+    min   <374, 165, 0>;
+    max   <614, 195, 29>;
+    flag WFB Flag;
+}
 }
 
 StabilityChecker
 {
-    checkFrequency 10000;
+    checkFrequency 100;
     streamOutput   false;
     vtkOutput      true;
 }
 
 Output
 {
-    welfordInterval 1200000;
+    welfordInterval 1000;
     VTK
     {
-        writeFrequency 2400000;
-        startTimestep  2399990;
+        writeFrequency 5000;
+        startTimestep  27000;
         ghostLayers    0;
+        samplingDx 1;
+        samplingDy 1;
+        samplingDz 1;
 
-        baseFolder           vtk_out_SH_12_WFB_X150_WI_1200000_TB_slip_Initialization_asmuth_Perturbation_xy_SigmaN_36_TEST_1_Double_Single_precision_Comparison;
+        baseFolder           vtk_out_Juergen Rauleder_paper_reduced_box_960x360x192_Test_9_obstacle_WFB;
         executionFolder      simulation_step;
+
+    inclusion_filters
+    {
+        DynamicAABB
+        {
+            trajectoryType piecewise_linear;
+            limitMode clamp;
+            center0 <445, 180, 40>;
+            size0 <350, 140, 80>;
+
+            point
+            {
+                step 2700;
+                center <550, 180, 40>;
+            }
+
+            point
+            {
+                step 3050;
+                center <650, 180, 40>;
+            }
+
+            point
+            {
+                step 3400;
+                center <750, 180, 40>;
+            }
+
+            point
+            {
+                step 3750;
+                center <445, 180, 40>;
+            }
+        }
+    }
 
         fields {
             Density;

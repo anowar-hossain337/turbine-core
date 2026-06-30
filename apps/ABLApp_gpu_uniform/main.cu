@@ -295,25 +295,44 @@ int main(int argc, char** argv) {
     const uint_t vtkGhostLayers = vtkConfig.getParameter<uint_t>("ghostLayers", uint_t(0));
     const std::string vtkBaseFolder = vtkConfig.getParameter<std::string>("baseFolder", "vtk_out");
     const std::string vtkExecutionFolder = vtkConfig.getParameter<std::string>("executionFolder", "simulation_step");
-
+    const real_t vtkSamplingResolution = vtkConfig.getParameter<real_t>("samplingResolution", real_t(-1));
+    // Reason for edit start: store shared dynamic AABB filter state and version-1 piecewise-linear trajectory keyframes so copied VTK filters all observe the same runtime-updated bounds.
+    struct DynamicAABBKeyframe {
+        uint_t step;
+        walberla::Vector3<real_t> center;
+        walberla::Vector3<real_t> size;
+    };
+    struct DynamicAABBMotion {
+        std::shared_ptr<output::DynamicAABBInclusionFilter::State> state;
+        std::vector<DynamicAABBKeyframe> keyframes;
+        bool clampToDomain;
+    };
+    std::vector<DynamicAABBMotion> dynamicAABBMotions{};
+    // Reason for edit end: store shared dynamic AABB filter state and version-1 piecewise-linear trajectory keyframes so copied VTK filters all observe the same runtime-updated bounds.
     std::shared_ptr<walberla::vtk::VTKOutput> fieldVTKOutput{nullptr};
     if(vtkWriteFrequency > 0) {
         fieldVTKOutput = walberla::vtk::createVTKOutput_BlockData(
-                *blocks,
-                "abl_gpu_uniform",
-            uint_t(1),
+                *blocks, //structured block storage
+                "abl_gpu_uniform", // Identifier
+            uint_t(1), //writefrequency
                 vtkGhostLayers,
-                false,
+                false, //forcePVTU
                 vtkBaseFolder,
                 vtkExecutionFolder,
-                true,
-                true,
-                true,
-                true,
-                uint_t(0),
-                false,
-                false);
-
+                true, //continuousNumbering
+                true, // binaryOutput
+                true, // littleEndianOutput
+                true, // useMPIIO
+                uint_t(0), //Initial Execution Count
+                false, //amrFileFormat
+                false); //oneFilePerProcess
+        fieldVTKOutput->setSamplingResolution(vtkSamplingResolution);
+        if(vtkConfig.isDefined("samplingDx")) {
+            const real_t vtkSamplingDx = vtkConfig.getParameter<real_t>("samplingDx", real_t(-1));
+            const real_t vtkSamplingDy = vtkConfig.getParameter<real_t>("samplingDy", real_t(-1));
+            const real_t vtkSamplingDz = vtkConfig.getParameter<real_t>("samplingDz", real_t(-1));
+            fieldVTKOutput->setSamplingResolution(vtkSamplingDx, vtkSamplingDy, vtkSamplingDz);
+        }
         // fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<ScalarField_T>>(densityFieldCpuID, "Density"));
         fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<VectorField_T>>(velocityFieldCpuID, "Velocity"));
         fieldVTKOutput->addCellDataWriter(std::make_shared<walberla::field::VTKWriter<VectorField_T>>(meanVelocityOutputFieldCpuID, "MeanVelocityOutput"));
@@ -655,9 +674,15 @@ int main(int argc, char** argv) {
     // Reason for edit end: run the top-only zero-normal-pressure-gradient sweep immediately after the boundary handling sweep so it becomes the only active top treatment when the generated FreeSlip path has been skipped.
 
     timeloop.add() << walberla::Sweep(sweepCollection.streamCollide(), "LBM stream-collide")
+                   // Reason for edit start: run the optional line probes in the same post-collide output slot as VTK so prm-controlled VTK and line output can be enabled independently without disturbing the solver order.
+                   << walberla::AfterFunction(updateDynamicAABBFilters, "Dynamic AABB filter update")
                    << walberla::AfterFunction(writeVTK, "VTK output")
                    << walberla::AfterFunction(writeLineOutput, "Line output");
+                   // Reason for edit end: run the optional line probes in the same post-collide output slot as VTK so prm-controlled VTK and line output can be enabled independently without disturbing the solver order.
 
+    // Temporary benchmark toggle: comment out all Welford timeloop registration
+    // blocks instead of deleting them, so we can restore the current version later.
+    
     if(boundarySetup.wallType() == WallSetup::WFB) {
         timeloop.add() << walberla::BeforeFunction([&]() {
                            welfordWFBSweep.setCounter(real_t(welfordWFBSweep.getCounter() + 1));
