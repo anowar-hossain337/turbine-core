@@ -28,14 +28,26 @@ waLBerla_generate_target_from_python(
         Drivers.h Drivers.cu
 )
 
+# Reason for edit start: extend the local PSM code-generation target so Phase 2 can build the real stationary-sphere coupling kernels while keeping the default ABL path available.
+waLBerla_generate_target_from_python(
+        NAME ABLApp_gpu_uniform_PSM_Generation
+        FILE ABLPSMGeneration.py
+        OUT_FILES
+        waLBerlaABLPSM_Sweep.cu waLBerlaABLPSM_Sweep.h
+        waLBerlaABLPSM_InitializeDomainForPSM.cu waLBerlaABLPSM_InitializeDomainForPSM.h
+        waLBerlaABLPSM_KernelInfo.h
+)
+# Reason for edit end: extend the local PSM code-generation target so Phase 2 can build the real stationary-sphere coupling kernels while keeping the default ABL path available.
+
 waLBerla_add_executable(
         NAME ABLApp_gpu_uniform
         FILES main.cu
-        # Reason for edit start: link the shared output helper library so ABLApp_gpu_uniform can reuse prm-driven line-output support while keeping its existing hardcoded VTK writer.
+        # Reason for edit start: link the shared output helper library and Phase 2 MesaPD dependencies so the app can build both generated paths while keeping runtime PSM disabled by default.
         DEPENDS walberla::core walberla::blockforest walberla::domain_decomposition walberla::field walberla::lbm
-                walberla::timeloop walberla::gpu walberla::output
+                walberla::timeloop walberla::gpu walberla::output walberla::mesa_pd walberla::lbm_mesapd_coupling
                 ABLApp_gpu_uniform_Generation
+                ABLApp_gpu_uniform_PSM_Generation
                 domain component
                 wind_turbine_core
-        # Reason for edit end: link the shared output helper library so ABLApp_gpu_uniform can reuse prm-driven line-output support while keeping its existing hardcoded VTK writer.
+        # Reason for edit end: link the shared output helper library and Phase 2 MesaPD dependencies so the app can build both generated paths while keeping runtime PSM disabled by default.
 )

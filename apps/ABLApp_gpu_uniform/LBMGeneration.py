@@ -30,187 +30,59 @@ from lbmpy_walberla.additional_data_handler import OutflowAdditionalDataHandler
 from lbmpy.relaxationrates import *
 
 from codegen_walberla_wind import generate_flow_driver_collection
-
-info_header = """
-
-using flag_t = walberla::uint8_t;
-using FlagField_T = walberla::FlagField<flag_t>;
-
-using StorageSpecification_T = walberla::lbm::{name}_StorageSpecification;
-using Stencil_T              = StorageSpecification_T::Stencil;
-using CommunicationStencil_T = StorageSpecification_T::CommunicationStencil;
-
-using PdfField_T           = walberla::lbm_generated::PdfField< StorageSpecification_T >;
-using PdfGPUField_T        = walberla::lbm_generated::GPUPdfField< StorageSpecification_T >;
-using BoundaryCollection_T = walberla::lbm::{name}_BoundaryCollection< FlagField_T >;
-
-using SweepCollection_T = walberla::lbm::{name}_SweepCollection;
-
-static const walberla::FlagUID FluidFlagUID("Fluid Flag");
-static const walberla::FlagUID NoSlipFlagUID("{noslip_flag}");
-static const walberla::FlagUID WFBFlagUID("{wfb_flag}");
-static const walberla::FlagUID SymmetryFlagUID("{symmetry_flag}");
-static const walberla::FlagUID UniformInflowFlagUID("{uniform_inflow_flag}");
-static const walberla::FlagUID LogLawInflowFlagUID("{loglaw_inflow_flag}");
-static const walberla::FlagUID OutflowFlagUID("{outflow_flag}");
-static const walberla::FlagUID TopOutflowFlagUID("{top_outflow_flag}");
-
-namespace codegen {{
-
-    struct KernelInfo {{
-
-        static constexpr char stencil[]     = "{stencil}";
-        static constexpr char method[]      = "{method}";
-        static constexpr char forceModel[]  = "{forceModel}";
-
-        static constexpr walberla::uint_t q = {q};
-
-        static constexpr walberla::field::Layout layout = walberla::field::{layout};
-        static constexpr char streamingPattern[] = "{streaming_pattern}";
-
-        static constexpr bool compressible = {compressible};
-        static constexpr bool zeroCentered = {zeroCentered};
-        static constexpr char subgridScaleModel[] = "{subgridScaleModel}";
-
-        static constexpr char cpuVectoriseInfo[] = "{cpuVectoriseInfo}";
-        static constexpr char lbmOptimisationDict[] = "{lbmOptimisation}";
-
-    }};
-
-    constexpr char KernelInfo::stencil[];
-    constexpr char KernelInfo::method[];
-    constexpr char KernelInfo::forceModel[];
-
-    constexpr char KernelInfo::cpuVectoriseInfo[];
-    constexpr char KernelInfo::lbmOptimisationDict[];
-
-}} // namespace codegen
-
-"""
-
-compile_time_block_size = True
-max_threads = 256
-
-if compile_time_block_size:
-    sweep_block_size = (128, 1, 1)
-else:
-    sweep_block_size = (TypedSymbol("gpuBlockSize0", np.int32),
-                        TypedSymbol("gpuBlockSize1", np.int32),
-                        TypedSymbol("gpuBlockSize2", np.int32))
-
-gpu_indexing_params = {'block_size': sweep_block_size}
-
-ghost_layers = 1
-
-# Parsing the "compressible" parameter from input.prm file to determine if the flow should be treated as compressible or incompressible. This is done by looking for a parameter named "compressible" in the input.prm file and parsing its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True (compressible flow).
-def _parse_bool_token(token: str):
-    value = token.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    return None
-
-
-def _load_compressible_from_prm(default=True):
-    candidates = [Path.cwd() / "input.prm", Path(__file__).with_name("input.prm")]
-    for prm_path in candidates:
-        if not prm_path.exists():
-            continue
-
-        content = prm_path.read_text(encoding="utf-8", errors="ignore")
-        parameters_match = re.search(r"Parameters\s*\{(?P<body>.*?)\}", content, flags=re.DOTALL)
-        search_space = parameters_match.group("body") if parameters_match else content
-        key_match = re.search(r"\bcompressible\b\s+([^\s;]+)", search_space)
-        if not key_match:
-            continue
-
-        parsed = _parse_bool_token(key_match.group(1))
-        if parsed is not None:
-            return parsed
-
-    return default
-# The above function is added to allow reading parameters from input.prm file to set compressibility of the flow. The function looks for a parameter named "compressible" in the input.prm file and parses its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True (compressible flow).
+# Reason for edit start: import the shared ABL codegen helper so this generator and the new local PSM scaffold stay locked to the same numerical setup.
+from ABLCodegenCommon import (
+    ABL_KERNEL_INFO_TEMPLATE,
+    COMMON_FLAG_UIDS,
+    GHOST_LAYERS,
+    GPU_INDEXING_PARAMS,
+    MAX_THREADS,
+    build_abl_additional_headers,
+    build_abl_field_typedefs,
+    build_abl_info_header_params,
+    create_abl_common_setup,
+)
+# Reason for edit end: import the shared ABL codegen helper so this generator and the new local PSM scaffold stay locked to the same numerical setup.
 
 with CodeGeneration() as ctx:
-
-    target = Target.GPU
-    layout = 'fzyx'
-    streaming_pattern = 'pull'
-
-    omega = sp.Symbol("omega")
-    # Reading the compressibility of the flow from input.prm file using the function defined above. This allows users to set the flow as compressible or incompressible by specifying the "compressible" parameter in the input.prm file. If the parameter is not specified, it defaults to True (compressible flow).
-    # Defaut is true to maintain the same behaviour as before when the parameter was not read from the input.prm file.
-    compressible_flow = _load_compressible_from_prm(default=True)
-    # Above line is added to read the compressibility of the flow from input.prm file using the function defined above. This allows users to set the flow as compressible or incompressible by specifying the "compressible" parameter in the input.prm file. If the parameter is not specified, it defaults to True (compressible flow).
-
-    data_type = 'double' if ctx.double_accuracy else 'float32'
-
-    density_field = ps.fields(f"density: {data_type}[3D]", layout=layout)
-    velocity_field = ps.fields(f"velocity(3): {data_type}[3D]", layout=layout)
-    mean_velocity_field = ps.fields(f"mean_velocity(3): {data_type}[3D]", layout=layout)
-    sum_of_squares_field = ps.fields(f"sum_of_squares(9): {data_type}[3D]", layout=layout)
-    force_field = ps.fields(f"force(3): {data_type}[3D]", layout=layout)
-    omega_field = ps.fields(f"omega_out: {data_type}[3D]", layout=layout)
-    eddy_viscosity_field = ps.fields(f"eddy_viscosity: {data_type}[3D]", layout=layout)
-    mean_eddy_viscosity_field = ps.fields(f"mean_eddy_viscosity: {data_type}[3D]", layout=layout)
-    strain_rate_field = ps.fields(f"strain_rate(9): {data_type}[3D]", layout=layout)
-
-    mean_strain_rate_field = ps.fields(f"mean_strain_rate(9): {data_type}[3D]", layout=layout)
-
-    # lattice Boltzmann method
-
-    # stencil = LBStencil(Stencil.D3Q27)
-    stencil = LBStencil(Stencil.D3Q19)
-    q = stencil.Q
-
-    # newlines to disable galilean correction for D3Q19 (as it  is not supported in cumulant method for D3Q19)
-    use_galilean_correction = stencil.name == 'D3Q27'
-    fourth_order_correction = 0.1 if use_galilean_correction else 0.0
-
-    pdfs, pdfs_tmp = ps.fields(f"pdfs({q}), pdfs_tmp({q}): {data_type}[3D]", layout=layout)
-    macroscopic_fields = {'density': density_field, 'velocity': velocity_field}
-
-    lbm_config = LBMConfig(stencil=stencil, streaming_pattern=streaming_pattern,
-                           method=Method.CUMULANT, relaxation_rate=omega,
-                           # galilean_correction=True, fourth_order_correction=0.1,
-                           # following 2 lines are added to enable galillean correction for D3Q27 and disable it for D3Q19 (as it is not supported in cumulant method for D3Q19)
-                           galilean_correction=use_galilean_correction, 
-                           fourth_order_correction=fourth_order_correction,
-                           # above 2 lines are added to enable galillean correction for D3Q27 and disable it for D3Q19 (as it is not supported in cumulant method for D3Q19)
-                           force_model=ForceModel.GUO, force=force_field.center_vector,
-                           subgrid_scale_model=SubgridScaleModel.SMAGORINSKY,
-                            # read compressible parameter from input.prm file to set the flow as compressible or incompressible. This is done by looking for a parameter named "compressible" in the input.prm file and parsing its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True (compressible flow).
-                           compressible=compressible_flow, zero_centered=compressible_flow,
-                           # above line is added to read compressible parameter from input.prm file to set the flow as compressible or incompressible. This is done by looking for a parameter named "compressible" in the input.prm file and parsing its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True (compressible flow).
-                           omega_output_field=omega_field,
-                           eddy_viscosity_field=eddy_viscosity_field,
-                           output=macroscopic_fields)
-
-    lbm_optimisation = LBMOptimisation(field_layout=layout, symbolic_field=pdfs, cse_global=True, cse_pdfs=False)
-
-    if not is_inplace(streaming_pattern):
-        lbm_opt = replace(lbm_optimisation, symbolic_temporary_field=pdfs_tmp)
-        field_swaps = [(pdfs, pdfs_tmp)]
-    else:
-        field_swaps = []
-
-    collision_rule = create_lb_collision_rule(lbm_config=lbm_config, lbm_optimisation=lbm_optimisation)
-    collision_rule = insert_fast_divisions(collision_rule)
-    collision_rule = insert_fast_sqrts(collision_rule)
-
-    lb_method = collision_rule.method
+    # Reason for edit start: source the ABL stencil, forcing, SGS model, and shared field layout from one helper so this generator remains behavior-identical while becoming reusable for the future PSM path.
+    common_setup = create_abl_common_setup(ctx)
+    target = common_setup["target"]
+    layout = common_setup["layout"]
+    streaming_pattern = common_setup["streaming_pattern"]
+    omega = common_setup["omega"]
+    data_type = common_setup["data_type"]
+    density_field = common_setup["density_field"]
+    velocity_field = common_setup["velocity_field"]
+    mean_velocity_field = common_setup["mean_velocity_field"]
+    sum_of_squares_field = common_setup["sum_of_squares_field"]
+    force_field = common_setup["force_field"]
+    omega_field = common_setup["omega_field"]
+    eddy_viscosity_field = common_setup["eddy_viscosity_field"]
+    mean_eddy_viscosity_field = common_setup["mean_eddy_viscosity_field"]
+    strain_rate_field = common_setup["strain_rate_field"]
+    mean_strain_rate_field = common_setup["mean_strain_rate_field"]
+    stencil = common_setup["stencil"]
+    q = common_setup["q"]
+    pdfs = common_setup["pdfs"]
+    macroscopic_fields = common_setup["macroscopic_fields"]
+    lbm_config = common_setup["lbm_config"]
+    lbm_optimisation = common_setup["lbm_optimisation"]
+    collision_rule = common_setup["collision_rule"]
+    lb_method = common_setup["lb_method"]
+    cpu_vectorise_info = common_setup["cpu_vectorise_info"]
+    # Reason for edit end: source the ABL stencil, forcing, SGS model, and shared field layout from one helper so this generator remains behavior-identical while becoming reusable for the future PSM path.
 
     # Welford update
     welford_wfb_update = welford_assignments(field=velocity_field, mean_field=mean_velocity_field)
     generate_sweep(ctx, "waLBerlaABL_WelfordWFB", welford_wfb_update, target=target,
-                   gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
+                   gpu_indexing_params=GPU_INDEXING_PARAMS, max_threads=MAX_THREADS)
 
     # Welford update for output
     welford_output_update = welford_assignments(field=velocity_field, mean_field=mean_velocity_field,
                                                 sum_of_squares_field=sum_of_squares_field)
     generate_sweep(ctx, "waLBerlaABL_WelfordOutput", welford_output_update, target=target,
-                   gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
+                   gpu_indexing_params=GPU_INDEXING_PARAMS, max_threads=MAX_THREADS)
 
     @ps.kernel
     def sos_resetter():
@@ -244,13 +116,14 @@ with CodeGeneration() as ctx:
     generate_sweep(ctx, 'waLBerlaABL_MacroGetter', getter_assignments)
 
     # GENERATE BOUNDARIES
-    noslip_uid = 'NoSlip Flag'
-    wfb_uid = 'WFB Flag'
-    symmetry_uid = 'Symmetry Flag'
-    uniform_inflow_uid = 'Uniform Inflow Flag'
-    loglaw_inflow_uid = 'LogLaw Inflow Flag'
-    outflow_uid = 'Outflow Flag'
-    top_outflow_uid = 'TopOutflow Flag'
+    noslip_uid = COMMON_FLAG_UIDS["noslip"]
+    wfb_uid = COMMON_FLAG_UIDS["wfb"]
+    symmetry_uid = COMMON_FLAG_UIDS["symmetry"]
+    uniform_inflow_uid = COMMON_FLAG_UIDS["uniform_inflow"]
+    loglaw_inflow_uid = COMMON_FLAG_UIDS["loglaw_inflow"]
+    outflow_uid = COMMON_FLAG_UIDS["outflow"]
+    top_outflow_uid = COMMON_FLAG_UIDS["top_outflow"]
+    fix_density_uid = 'FixDensity Flag'
 
     free_slip = lbm_boundary_generator(class_name='waLBerlaABL_FreeSlip', flag_uid=symmetry_uid,
                                        boundary_object=FreeSlip(lb_method.stencil, normal_direction=(0, 0, -1)))
@@ -297,68 +170,29 @@ with CodeGeneration() as ctx:
     )
 
     generate_sweep(ctx, "waLBerlaABL_StrainRateWriter", strain_rate_ac, target=target,
-                   gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
+                   gpu_indexing_params=GPU_INDEXING_PARAMS, max_threads=MAX_THREADS)
 
     # FLOW DRIVERS
     generate_flow_driver_collection(ctx, "FlowDriverCollection", force_field=force_field, velocity_field=velocity_field,
-                                    target=target, ghost_layers_to_include=ghost_layers, namespace='wind',
-                                    gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
+                                    target=target, ghost_layers_to_include=GHOST_LAYERS, namespace='wind',
+                                    gpu_indexing_params=GPU_INDEXING_PARAMS, max_threads=MAX_THREADS)
 
     name = 'waLBerlaABL'
-    cpu_vectorise_info = {'nontemporal': True}
     generate_lbm_package(ctx, name=f"{name}_",
                          collision_rule=collision_rule,
                          lbm_config=lbm_config, lbm_optimisation=lbm_optimisation,
                          nonuniform=False, boundaries=[no_slip, free_slip, wfb, uniform_ubb, loglaw_ubb, outflow, top_outflow],
                          macroscopic_fields=macroscopic_fields,
-                         target=target, gpu_indexing_params=gpu_indexing_params, max_threads=max_threads,
+                         target=target, gpu_indexing_params=GPU_INDEXING_PARAMS, max_threads=MAX_THREADS,
                          cpu_vectorize_info=cpu_vectorise_info)
-
-    info_header_params = {
-        'name': name,
-        'stencil': lbm_config.stencil.name,
-        'q': q,
-        'method': type(lbm_config.method).__name__,
-        'forceModel': type(lbm_config.force_model).__name__,
-        'layout': layout,
-        'streaming_pattern': streaming_pattern,
-        'compressible': 'true' if lbm_config.compressible else 'false',
-        'zeroCentered': 'true' if lbm_config.zero_centered else 'false',
-        'subgridScaleModel': lbm_config.subgrid_scale_model if lbm_config.subgrid_scale_model else 'false',
-        'cpuVectoriseInfo': str(cpu_vectorise_info),
-        'lbmOptimisation': str(vars(lbm_optimisation)),
-        'noslip_flag': noslip_uid,
-        'wfb_flag': wfb_uid,
-        'symmetry_flag': symmetry_uid,
-        'uniform_inflow_flag': uniform_inflow_uid,
-        'loglaw_inflow_flag': loglaw_inflow_uid,
-        'outflow_flag': outflow_uid,
-        'top_outflow_flag': top_outflow_uid
-    }
-
-    field_typedefs = {
-        'ScalarField_T': ps.fields(f"dummy: {data_type}[3D]", layout=layout),
-        'VectorField_T': ps.fields(f"dummy(3): {data_type}[3D]", layout=layout),
-        'SecondOrderTensorField_T': ps.fields(f"dummy(9): {data_type}[3D]", layout=layout),
-        'ThirdOrderTensorField_T': ps.fields(f"dummy(27): {data_type}[3D]", layout=layout)
-    }
-
-    additional_headers = {
-        "field/Layout.h",
-        "lbm_generated/field/PdfField.h",
-        "lbm_generated/field/AddToStorage.h",
-        "lbm_generated/gpu/GPUPdfField.h",
-        "lbm_generated/gpu/AddToStorage.h",
-        "gpu/AddGPUFieldToStorage.h",
-        "gpu/HostFieldAllocator.h",
-        "gpu/communication/MemcpyPackInfo.h",
-        "gpu/ShiftedPeriodicity.h",
-        "lbm_generated/gpu/UniformGeneratedGPUPdfPackInfo.h",
-        "gpu/communication/UniformGPUScheme.h",
-    }
+    # Reason for edit start: reuse the shared metadata builders so the plain ABL kernel header and the new PSM scaffold report the same numerical contract.
+    info_header_params = build_abl_info_header_params(name, common_setup)
+    field_typedefs = build_abl_field_typedefs(common_setup)
+    additional_headers = build_abl_additional_headers()
 
     generate_info_header(ctx, 'waLBerlaABL_KernelInfo',
                          field_typedefs=field_typedefs,
                          additional_headers=additional_headers,
-                         additional_code=info_header.format(**info_header_params)
+                         additional_code=ABL_KERNEL_INFO_TEMPLATE.format(**info_header_params)
                          )
+    # Reason for edit end: reuse the shared metadata builders so the plain ABL kernel header and the new PSM scaffold report the same numerical contract.

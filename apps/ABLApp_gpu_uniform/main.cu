@@ -41,12 +41,28 @@
 #include "walberla_helper/field/all.h"
 #include "wind_turbine_core/ProjectDefines.h"
 
+// Reason for edit start: include the MesaPD and PSM runtime helpers so one optional Phase 3 kinematic sphere can be coupled on top of the existing static-obstacle ABL path when explicitly enabled.
+#include "lbm_mesapd_coupling/DataTypesCodegen.h"
+#include "lbm_mesapd_coupling/partially_saturated_cells_method/codegen/PSMSweepCollection.h"
+#include "lbm_mesapd_coupling/utility/ParticleSelector.h"
+#include "lbm_mesapd_coupling/utility/ResetHydrodynamicForceTorqueKernel.h"
+#include "mesa_pd/data/ParticleAccessorWithShape.h"
+#include "mesa_pd/data/ParticleStorage.h"
+#include "mesa_pd/data/ShapeStorage.h"
+#include "mesa_pd/data/shape/Sphere.h"
+#include "mesa_pd/kernel/ParticleSelector.h"
+#include "waLBerlaABLPSM_InitializeDomainForPSM.h"
+#include "waLBerlaABLPSM_Sweep.h"
+// Reason for edit end: include the MesaPD and PSM runtime helpers so one optional Phase 3 kinematic sphere can be coupled on top of the existing static-obstacle ABL path when explicitly enabled.
+
+// Reason for edit start: include the shared moving-body config parser and both generated kernel-info headers so the app can validate and log the legacy ABL path and the optional Phase 3 PSM path from prm settings.
+#include "MovingBodyConfig.h"
 #include "TopDampingZone.h"
-// Reason for edit start: include the top-only zero-normal-pressure-gradient helper as an app-level extension so the bottom WFB path and generated boundary package stay untouched.
 #include "TopSlipZeroGradientBoundary.h"
-// Reason for edit end: include the top-only zero-normal-pressure-gradient helper as an app-level extension so the bottom WFB path and generated boundary package stay untouched.
 #include "waLBerlaABL_KernelInfo.h"
+#include "waLBerlaABLPSM_KernelInfo.h"
 #include "FlowDriverCollection.h"
+// Reason for edit end: include the shared moving-body config parser and both generated kernel-info headers so the app can validate and log the legacy ABL path and the optional Phase 3 PSM path from prm settings.
 
 namespace turbine_core {
 
@@ -68,6 +84,133 @@ int main(int argc, char** argv) {
 
     auto globalConfig = walberlaEnv.config();
     auto parameters = globalConfig->getOneBlock("Parameters");
+    // Reason for edit start: normalize prm tokens once so the optional Phase 3 moving-body checks and the existing top-boundary checks can share the same case-insensitive parsing logic.
+    const auto normalizeConfigToken = [](std::string value) {
+        value.erase(std::remove_if(value.begin(), value.end(),
+                                   [](unsigned char ch) { return std::isspace(ch) != 0; }),
+                    value.end());
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
+    };
+    // Reason for edit end: normalize prm tokens once so the optional Phase 3 moving-body checks and the existing top-boundary checks can share the same case-insensitive parsing logic.
+
+    // Reason for edit start: validate the optional Phase 3 kinematic-sphere path early so the default urban ABL run stays unchanged unless all three feature toggles are enabled together.
+    const moving_body::RuntimeConfig movingBodyRuntimeConfig = moving_body::loadRuntimeConfig(globalConfig);
+    const bool psmCouplingRequested = movingBodyRuntimeConfig.anyFeatureEnabled();
+    const bool psmCouplingEnabled =
+            movingBodyRuntimeConfig.mesaPD.enabled &&
+            movingBodyRuntimeConfig.psm.enabled &&
+            movingBodyRuntimeConfig.body.enabled;
+    const std::string movingBodyModeName = normalizeConfigToken(movingBodyRuntimeConfig.body.mode);
+    const std::string movingBodyRepresentationName =
+            normalizeConfigToken(movingBodyRuntimeConfig.body.representation);
+    const std::string movingBodyTrajectoryTypeName =
+            normalizeConfigToken(movingBodyRuntimeConfig.body.trajectoryType);
+    if (psmCouplingRequested && !psmCouplingEnabled) {
+        WALBERLA_ABORT("Phase 3 moving-body coupling requires MesaPD::enabled, PSM::enabled, and MovingBody::enabled to all be true together.")
+    }
+    if (psmCouplingEnabled) {
+        WALBERLA_CHECK(!movingBodyRuntimeConfig.psm.phase1ScaffoldOnly,
+                       "Phase 3 runtime coupling requires PSM::phase1ScaffoldOnly = false.")
+        WALBERLA_CHECK(movingBodyModeName == "kinematic",
+                       "Phase 3 currently supports only MovingBody::mode = kinematic.")
+        WALBERLA_CHECK(movingBodyRepresentationName == "sphere",
+                       "Phase 3 currently supports only MovingBody::representation = sphere.")
+        WALBERLA_CHECK_GREATER(movingBodyRuntimeConfig.body.radius, real_t(0),
+                               "MovingBody::radius must be positive.")
+        if (movingBodyRuntimeConfig.body.trajectoryPointCount > uint_t(1)) {
+            WALBERLA_CHECK(movingBodyTrajectoryTypeName == "piecewise_linear",
+                           "Phase 3 currently supports only Trajectory::type = piecewise_linear.")
+        }
+
+        WALBERLA_LOG_INFO_ON_ROOT("MesaPD/PSM Phase 3 kinematic-sphere coupling enabled.")
+        WALBERLA_LOG_INFO_ON_ROOT("PSM runtime numerics: stencil = " << codegen::psm::KernelInfo::stencil
+                                  << ", method = " << codegen::psm::KernelInfo::method
+                                  << ", forceModel = " << codegen::psm::KernelInfo::forceModel
+                                  << ", maxParticlesPerCell = " << codegen::psm::KernelInfo::maxParticlesPerCell)
+
+        if (movingBodyRuntimeConfig.body.trajectoryPointCount > uint_t(1)) {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving sphere trajectory: piecewise-linear keyframes = "
+                                      << movingBodyRuntimeConfig.body.trajectoryPointCount)
+        } else if (movingBodyRuntimeConfig.body.trajectoryPointCount == uint_t(1)) {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving sphere trajectory: single keyframe, sphere will stay fixed at "
+                                      << movingBodyRuntimeConfig.body.trajectoryPoints.front().center)
+        } else if (movingBodyRuntimeConfig.body.initialVelocity.sqrLength() > real_t(0)) {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving sphere trajectory: constant-velocity motion from initialPosition.")
+        } else {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving sphere trajectory: no keyframes and zero initialVelocity, sphere remains stationary.")
+        }
+        if (movingBodyRuntimeConfig.mesaPD.subcycles != uint_t(1)) {
+            WALBERLA_LOG_INFO_ON_ROOT("MesaPD::subcycles is parsed, but Phase 3 still uses one LBM update per timestep without subcycling.")
+        }
+    }
+    // Reason for edit end: validate the optional Phase 3 kinematic-sphere path early so the default urban ABL run stays unchanged unless all three feature toggles are enabled together.
+
+    // Reason for edit start: evaluate the optional Phase 3 kinematic sphere from either a constant velocity or piecewise-linear keyframes so the PSM path can update the particle state every timestep.
+    struct MovingSphereState
+    {
+        walberla::Vector3<real_t> center{ real_t(0), real_t(0), real_t(0) };
+        walberla::Vector3<real_t> velocity{ real_t(0), real_t(0), real_t(0) };
+    };
+
+    const auto evaluateMovingSphereState = [&](const uint_t step) {
+        MovingSphereState state{};
+
+        if (movingBodyRuntimeConfig.body.trajectoryPoints.empty()) {
+            state.center = movingBodyRuntimeConfig.body.initialPosition;
+            state.velocity = movingBodyRuntimeConfig.body.initialVelocity;
+            for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+                state.center[d] += real_t(step) * state.velocity[d];
+            }
+            return state;
+        }
+
+        if (movingBodyRuntimeConfig.body.trajectoryPoints.size() == size_t(1) ||
+            step <= movingBodyRuntimeConfig.body.trajectoryPoints.front().step)
+        {
+            state.center = movingBodyRuntimeConfig.body.trajectoryPoints.front().center;
+            return state;
+        }
+
+        if (step >= movingBodyRuntimeConfig.body.trajectoryPoints.back().step) {
+            state.center = movingBodyRuntimeConfig.body.trajectoryPoints.back().center;
+            return state;
+        }
+
+        const auto upper = std::lower_bound(
+                movingBodyRuntimeConfig.body.trajectoryPoints.begin(),
+                movingBodyRuntimeConfig.body.trajectoryPoints.end(),
+                step,
+                [](const moving_body::TrajectoryPoint & point, const uint_t testStep) {
+                    return point.step < testStep;
+                });
+
+        WALBERLA_CHECK(upper != movingBodyRuntimeConfig.body.trajectoryPoints.begin(),
+                       "Phase 3 trajectory interpolation requires a lower keyframe.")
+        WALBERLA_CHECK(upper != movingBodyRuntimeConfig.body.trajectoryPoints.end(),
+                       "Phase 3 trajectory interpolation requires an upper keyframe.")
+
+        if (upper->step == step) {
+            state.center = upper->center;
+            const auto & lower = *(upper - 1);
+            const real_t dt = real_t(upper->step - lower.step);
+            for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+                state.velocity[d] = (upper->center[d] - lower.center[d]) / dt;
+            }
+            return state;
+        }
+
+        const auto & lower = *(upper - 1);
+        const real_t dt = real_t(upper->step - lower.step);
+        const real_t alpha = real_t(step - lower.step) / dt;
+        for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+            state.center[d] = lower.center[d] + alpha * (upper->center[d] - lower.center[d]);
+            state.velocity[d] = (upper->center[d] - lower.center[d]) / dt;
+        }
+        return state;
+    };
+    // Reason for edit end: evaluate the optional Phase 3 kinematic sphere from either a constant velocity or piecewise-linear keyframes so the PSM path can update the particle state every timestep.
 
     uint_t timesteps = parameters.getParameter<uint_t>("timesteps", uint_t(10));
     ++timesteps;
@@ -98,18 +241,10 @@ int main(int argc, char** argv) {
     const bool topDampingHorizontal = boundariesConfig.getParameter<bool>("topDampingHorizontal", true);
     const bool topDampingVertical = boundariesConfig.getParameter<bool>("topDampingVertical", true);
     // Reason for edit start: read and validate the new top-only zero-normal-pressure-gradient option so it can only run with setup=Open and the existing slip-like top naming.
-    const auto normalizeBoundaryOption = [](std::string value) {
-        value.erase(std::remove_if(value.begin(), value.end(),
-                                   [](unsigned char ch) { return std::isspace(ch) != 0; }),
-                    value.end());
-        std::transform(value.begin(), value.end(), value.begin(),
-                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-        return value;
-    };
     const bool topZeroNormalPressureGradient =
             boundariesConfig.getParameter<bool>("topZeroNormalPressureGradient", false);
     const std::string topBoundaryTypeName =
-            normalizeBoundaryOption(boundariesConfig.getParameter<std::string>("topBoundaryType", "symmetry"));
+            normalizeConfigToken(boundariesConfig.getParameter<std::string>("topBoundaryType", "symmetry"));
     const bool topBoundaryIsSlipLike =
             topBoundaryTypeName == "symmetry" || topBoundaryTypeName == "slip" || topBoundaryTypeName == "freeslip";
     if (topZeroNormalPressureGradient) {
@@ -213,6 +348,106 @@ int main(int argc, char** argv) {
 
     SweepCollection_T sweepCollection(blocks, densityFieldGpuID, eddyViscosityFieldGpuID, forceFieldGpuID, omegaFieldGpuID,
                                       pdfFieldGpuID, velocityFieldGpuID, omega);
+
+    // Reason for edit start: allocate the optional Phase 3 MesaPD and PSM runtime objects beside the existing GPU solver fields so one kinematic sphere can move through the unchanged urban ABL path.
+    using ParticleAccessor_T = walberla::mesa_pd::data::ParticleAccessorWithShape;
+    using PSMParticleAndVolumeFractionSoA_T =
+            walberla::lbm_mesapd_coupling::psm::gpu::ParticleAndVolumeFractionSoA_T<1>;
+    using PSMSweepCollection_T = walberla::lbm_mesapd_coupling::psm::gpu::PSMSweepCollection<
+            ParticleAccessor_T,
+            walberla::lbm_mesapd_coupling::GlobalParticlesSelector,
+            1>;
+
+    std::shared_ptr<walberla::mesa_pd::data::ParticleStorage> psmParticleStorage{};
+    std::shared_ptr<walberla::mesa_pd::data::ShapeStorage> psmShapeStorage{};
+    std::shared_ptr<ParticleAccessor_T> psmParticleAccessor{};
+    std::unique_ptr<PSMParticleAndVolumeFractionSoA_T> psmParticleAndVolumeFractionSoA{};
+    std::unique_ptr<PSMSweepCollection_T> psmSweepCollection{};
+    std::unique_ptr<walberla::pystencils::waLBerlaABLPSM_Sweep> psmSweep{};
+    std::unique_ptr<walberla::pystencils::waLBerlaABLPSM_InitializeDomainForPSM> psmPdfInitializer{};
+    walberla::lbm_mesapd_coupling::GlobalParticlesSelector psmGlobalParticleSelector{};
+    walberla::id_t psmSphereUID(0);
+
+    if (psmCouplingEnabled) {
+        const walberla::AABB & domainAABB = blocks->getDomain();
+        const auto validateSphereCenter = [&](const walberla::Vector3<real_t> & center, const char * description) {
+            for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+                WALBERLA_CHECK(center[d] - movingBodyRuntimeConfig.body.radius >= domainAABB.min(d) &&
+                               center[d] + movingBodyRuntimeConfig.body.radius <= domainAABB.max(d),
+                               description)
+            }
+        };
+
+        if (movingBodyRuntimeConfig.body.trajectoryPoints.empty()) {
+            validateSphereCenter(movingBodyRuntimeConfig.body.initialPosition,
+                                 "Phase 3 moving sphere must start fully inside the simulation domain.");
+        } else {
+            for (const auto & point : movingBodyRuntimeConfig.body.trajectoryPoints) {
+                validateSphereCenter(point.center,
+                                     "Phase 3 moving sphere trajectory points must stay fully inside the simulation domain.");
+            }
+        }
+
+        psmParticleStorage = std::make_shared<walberla::mesa_pd::data::ParticleStorage>(1);
+        psmShapeStorage = std::make_shared<walberla::mesa_pd::data::ShapeStorage>();
+        psmParticleAccessor = std::make_shared<ParticleAccessor_T>(psmParticleStorage, psmShapeStorage);
+
+        const auto sphereShape =
+                psmShapeStorage->create<walberla::mesa_pd::data::Sphere>(movingBodyRuntimeConfig.body.radius);
+        const MovingSphereState initialMovingSphereState = evaluateMovingSphereState(uint_t(0));
+        const walberla::mesa_pd::Vec3 movingSpherePosition(
+                initialMovingSphereState.center[0],
+                initialMovingSphereState.center[1],
+                initialMovingSphereState.center[2]);
+        const walberla::mesa_pd::Vec3 movingSphereVelocity(
+                initialMovingSphereState.velocity[0],
+                initialMovingSphereState.velocity[1],
+                initialMovingSphereState.velocity[2]);
+        walberla::mesa_pd::data::ParticleStorage::Particle&& movingSphere =
+                *psmParticleStorage->create(true);
+        movingSphere.setPosition(movingSpherePosition);
+        movingSphere.setLinearVelocity(movingSphereVelocity);
+        movingSphere.setInteractionRadius(movingBodyRuntimeConfig.body.radius);
+        movingSphere.setOwner(walberla::mpi::MPIManager::instance()->rank());
+        movingSphere.setShapeID(sphereShape);
+        psmSphereUID = movingSphere.getUid();
+
+        psmParticleAndVolumeFractionSoA =
+                std::make_unique<PSMParticleAndVolumeFractionSoA_T>(blocks, omega);
+        psmSweepCollection = std::make_unique<PSMSweepCollection_T>(
+                blocks,
+                psmParticleAccessor,
+                psmGlobalParticleSelector,
+                *psmParticleAndVolumeFractionSoA,
+                walberla::Vector3<uint_t>(uint_t(8), uint_t(8), uint_t(8)));
+        psmPdfInitializer =
+                std::make_unique<walberla::pystencils::waLBerlaABLPSM_InitializeDomainForPSM>(
+                        psmParticleAndVolumeFractionSoA->BsFieldID,
+                        psmParticleAndVolumeFractionSoA->BFieldID,
+                        densityFieldGpuID,
+                        forceFieldGpuID,
+                        psmParticleAndVolumeFractionSoA->particleVelocitiesFieldID,
+                        pdfFieldGpuID,
+                        velocityFieldGpuID);
+        psmSweep = std::make_unique<walberla::pystencils::waLBerlaABLPSM_Sweep>(
+                psmParticleAndVolumeFractionSoA->BsFieldID,
+                psmParticleAndVolumeFractionSoA->BFieldID,
+                densityFieldGpuID,
+                eddyViscosityFieldGpuID,
+                forceFieldGpuID,
+                omegaFieldGpuID,
+                psmParticleAndVolumeFractionSoA->particleForcesFieldID,
+                psmParticleAndVolumeFractionSoA->particleVelocitiesFieldID,
+                pdfFieldGpuID,
+                velocityFieldGpuID,
+                omega);
+
+        WALBERLA_LOG_INFO_ON_ROOT("Phase 3 kinematic sphere initial state: center = "
+                                  << initialMovingSphereState.center
+                                  << ", velocity = " << initialMovingSphereState.velocity
+                                  << ", radius = " << movingBodyRuntimeConfig.body.radius)
+    }
+    // Reason for edit end: allocate the optional Phase 3 MesaPD and PSM runtime objects beside the existing GPU solver fields so one kinematic sphere can move through the unchanged urban ABL path.
 
     WALBERLA_MPI_BARRIER()
     WALBERLA_LOG_INFO_ON_ROOT("Initialisation done")
@@ -378,9 +613,9 @@ int main(int argc, char** argv) {
             filterConfig.getBlocks("DynamicAABB", dynamicAABBFilterBlocks);
             for(const auto & filter : dynamicAABBFilterBlocks) {
                 const std::string trajectoryType =
-                        normalizeBoundaryOption(filter.getParameter<std::string>("trajectoryType", "piecewise_linear"));
+                        normalizeConfigToken(filter.getParameter<std::string>("trajectoryType", "piecewise_linear"));
                 const std::string limitMode =
-                        normalizeBoundaryOption(filter.getParameter<std::string>("limitMode", "clamp"));
+                        normalizeConfigToken(filter.getParameter<std::string>("limitMode", "clamp"));
                 WALBERLA_CHECK(trajectoryType == "piecewise_linear",
                                "DynamicAABB currently supports only trajectoryType = piecewise_linear.");
                 WALBERLA_CHECK(limitMode == "clamp",
@@ -591,8 +826,8 @@ int main(int argc, char** argv) {
 
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, densityFieldCpuID, densityFieldGpuID);
         walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, velocityFieldCpuID, velocityFieldGpuID);
-        walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, meanVelocityOutputFieldCpuID, meanVelocityOutputFieldGpuID);
-        walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>(blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID);
+        //walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, meanVelocityOutputFieldCpuID, meanVelocityOutputFieldGpuID);
+        //walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>(blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID);
         //walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>(blocks, forceFieldCpuID, forceFieldGpuID);
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, eddyViscosityFieldCpuID, eddyViscosityFieldGpuID);
         //walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>(blocks, omegaFieldCpuID, omegaFieldGpuID);
@@ -662,6 +897,53 @@ int main(int argc, char** argv) {
         for(auto & block : *blocks) { topDamping(&block); }
     }
 
+    // Reason for edit start: update the optional Phase 3 kinematic sphere from the prm trajectory before mapping so MesaPD and the PSM sweeps always see the same current particle state.
+    const auto applyMovingSphereState = [&](const uint_t step, const bool logState = false) {
+        if(!psmCouplingEnabled) {
+            return;
+        }
+
+        const MovingSphereState state = evaluateMovingSphereState(step);
+        const walberla::AABB & domainAABB = blocks->getDomain();
+        for(uint_t d = uint_t(0); d < uint_t(3); ++d) {
+            WALBERLA_CHECK(state.center[d] - movingBodyRuntimeConfig.body.radius >= domainAABB.min(d) &&
+                           state.center[d] + movingBodyRuntimeConfig.body.radius <= domainAABB.max(d),
+                           "Phase 3 moving sphere left the simulation domain.")
+        }
+
+        const size_t sphereIdx = psmParticleAccessor->uidToIdx(psmSphereUID);
+        WALBERLA_CHECK(sphereIdx != psmParticleAccessor->getInvalidIdx(),
+                       "Phase 3 moving sphere particle could not be found in the MesaPD accessor.")
+
+        psmParticleAccessor->setPosition(
+                sphereIdx,
+                walberla::mesa_pd::Vec3(state.center[0], state.center[1], state.center[2]));
+        psmParticleAccessor->setLinearVelocity(
+                sphereIdx,
+                walberla::mesa_pd::Vec3(state.velocity[0], state.velocity[1], state.velocity[2]));
+
+        if(logState) {
+            WALBERLA_LOG_INFO_ON_ROOT("Phase 3 moving sphere applied at step " << step
+                                      << ": center = " << state.center
+                                      << ", velocity = " << state.velocity)
+        }
+    };
+    // Reason for edit end: update the optional Phase 3 kinematic sphere from the prm trajectory before mapping so MesaPD and the PSM sweeps always see the same current particle state.
+
+    // Reason for edit start: map the Phase 3 kinematic sphere and reinitialize the surrounding PDFs once before the first timestep so the optional PSM path starts from a consistent fluid state.
+    if(psmCouplingEnabled) {
+        applyMovingSphereState(uint_t(0), true);
+        for(auto & block : *blocks) {
+            psmSweepCollection->particleMappingSweep(&block);
+        }
+        for(auto & block : *blocks) {
+            psmSweepCollection->setParticleVelocitiesSweep(&block);
+            (*psmPdfInitializer)(&block);
+        }
+        cudaDeviceSynchronize();
+    }
+    // Reason for edit end: map the Phase 3 kinematic sphere and reinitialize the surrounding PDFs once before the first timestep so the optional PSM path starts from a consistent fluid state.
+
     timeloop.add() << walberla::BeforeFunction(communication->getCommunicateFunctor(), "Field communication")
                    << walberla::BeforeFunction([&boundarySetup, &shiftedPeriodicity]() {
                        if(boundarySetup.inflowType() == InflowSetup::ShiftedPeriodic) shiftedPeriodicity();
@@ -673,16 +955,46 @@ int main(int argc, char** argv) {
     }
     // Reason for edit end: run the top-only zero-normal-pressure-gradient sweep immediately after the boundary handling sweep so it becomes the only active top treatment when the generated FreeSlip path has been skipped.
 
-    timeloop.add() << walberla::Sweep(sweepCollection.streamCollide(), "LBM stream-collide")
-                   // Reason for edit start: run the optional line probes in the same post-collide output slot as VTK so prm-controlled VTK and line output can be enabled independently without disturbing the solver order.
-                   << walberla::AfterFunction(updateDynamicAABBFilters, "Dynamic AABB filter update")
-                   << walberla::AfterFunction(writeVTK, "VTK output")
-                   << walberla::AfterFunction(writeLineOutput, "Line output");
-                   // Reason for edit end: run the optional line probes in the same post-collide output slot as VTK so prm-controlled VTK and line output can be enabled independently without disturbing the solver order.
+    // Reason for edit start: keep the legacy stream-collide path untouched when PSM is off and swap in the synchronized Phase 3 kinematic-sphere sweep sequence only when the optional coupling is enabled.
+    if(psmCouplingEnabled) {
+        const auto updateMovingSphereTrajectory = [&]() {
+            applyMovingSphereState(timeloop.getCurrentTimeStep());
+        };
+        const std::function<void(walberla::IBlock *)> psmParticleMappingSweep =
+                [&psmSweepCollection](walberla::IBlock * block) { psmSweepCollection->particleMappingSweep(block); };
+        const std::function<void(walberla::IBlock *)> psmSetParticleVelocitiesSweep =
+                [&psmSweepCollection](walberla::IBlock * block) { psmSweepCollection->setParticleVelocitiesSweep(block); };
+        const std::function<void(walberla::IBlock *)> psmStreamCollideSweep = psmSweep->getSweep();
+        const std::function<void(walberla::IBlock *)> psmReduceParticleForcesSweep =
+                [&psmSweepCollection](walberla::IBlock * block) { psmSweepCollection->reduceParticleForcesSweep(block); };
+
+        timeloop.add() << walberla::BeforeFunction(updateMovingSphereTrajectory, "Update moving sphere trajectory")
+                       << walberla::Sweep(
+                                walberla::lbm_mesapd_coupling::psm::gpu::deviceSyncWrapper(psmParticleMappingSweep),
+                                "Particle mapping");
+        timeloop.add() << walberla::Sweep(
+                                walberla::lbm_mesapd_coupling::psm::gpu::deviceSyncWrapper(psmSetParticleVelocitiesSweep),
+                                "Set particle velocities");
+        timeloop.add() << walberla::Sweep(
+                                walberla::lbm_mesapd_coupling::psm::gpu::deviceSyncWrapper(psmStreamCollideSweep),
+                                "ABL PSM stream-collide");
+        timeloop.add() << walberla::Sweep(
+                                walberla::lbm_mesapd_coupling::psm::gpu::deviceSyncWrapper(psmReduceParticleForcesSweep),
+                                "Reduce particle forces")
+                       << walberla::AfterFunction(updateDynamicAABBFilters, "Dynamic AABB filter update")
+                       << walberla::AfterFunction(writeVTK, "VTK output")
+                       << walberla::AfterFunction(writeLineOutput, "Line output");
+    } else {
+        timeloop.add() << walberla::Sweep(sweepCollection.streamCollide(), "LBM stream-collide")
+                       << walberla::AfterFunction(updateDynamicAABBFilters, "Dynamic AABB filter update")
+                       << walberla::AfterFunction(writeVTK, "VTK output")
+                       << walberla::AfterFunction(writeLineOutput, "Line output");
+    }
+    // Reason for edit end: keep the legacy stream-collide path untouched when PSM is off and swap in the synchronized Phase 3 kinematic-sphere sweep sequence only when the optional coupling is enabled.
 
     // Temporary benchmark toggle: comment out all Welford timeloop registration
     // blocks instead of deleting them, so we can restore the current version later.
-    
+
     if(boundarySetup.wallType() == WallSetup::WFB) {
         timeloop.add() << walberla::BeforeFunction([&]() {
                            welfordWFBSweep.setCounter(real_t(welfordWFBSweep.getCounter() + 1));
@@ -710,10 +1022,27 @@ int main(int argc, char** argv) {
                    }, "WelfordTopDamping counter")
                    << walberla::Sweep(welfordTopDampingLambda, "WelfordTopDamping sweep");
 
+    // Temporary benchmark toggle: comment out all Welford timeloop registration
+    // blocks instead of deleting them, so we can restore the current version later.
     timeloop.add() << walberla::Sweep(flowDriver, "Setting driving force");
     if(topDamping.isEnabled()) {
         timeloop.add() << walberla::Sweep(topDamping.getSweep(), "Top damping");
     }
+
+    // Reason for edit start: reset the per-timestep hydrodynamic force and torque only when the Phase 3 moving sphere is active so future force evaluation stays clean without changing default ABL runs.
+    if(psmCouplingEnabled) {
+        timeloop.addFuncAfterTimeStep(
+                [psmParticleStorage, psmParticleAccessor]() {
+                    psmParticleStorage->forEachParticle(
+                            false,
+                            walberla::mesa_pd::kernel::SelectAll(),
+                            *psmParticleAccessor,
+                            walberla::lbm_mesapd_coupling::ResetHydrodynamicForceTorqueKernel(),
+                            *psmParticleAccessor);
+                },
+                "Reset PSM hydrodynamic force");
+    }
+    // Reason for edit end: reset the per-timestep hydrodynamic force and torque only when the Phase 3 moving sphere is active so future force evaluation stays clean without changing default ABL runs.
 
     timeloop.addFuncAfterTimeStep(
             walberla::makeSharedFunctor(

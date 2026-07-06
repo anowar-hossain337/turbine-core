@@ -47,21 +47,81 @@ Parameters
 
 Initialisation {
     type asmuth; // logLaw; // uniform; //asmuth;
-    initialVelocity <1.621621622e-1, 0, 0>; //Used to calculate friction velocity
+    initialVelocity <0.122574545, 0, 0>; // Used to calculate friction velocity
 }
+
+// Reason for edit start: switch the example prm from the Phase 2 stationary sphere to a Phase 3 kinematic sphere test while keeping the static urban obstacle block unchanged.
+MesaPD
+{
+    enabled true;
+    subcycles 1;
+}
+
+PSM
+{
+    enabled true;
+    phase1ScaffoldOnly false; // Keep this false for the real Phase 3 runtime path
+}
+
+MovingBody
+{
+    enabled true;
+    mode kinematic; // Phase 3 currently supports only a kinematic sphere
+    representation sphere; // Phase 3 currently supports only sphere
+    radius 8;
+    initialPosition <800, 180, 50>;
+    initialVelocity <0, 0, 0>; // Used only when no trajectory keyframes are provided
+}
+
+Trajectory
+{
+    type piecewise_linear; // Phase 3 interpolates the sphere center between these keyframes
+
+    point
+    {
+        step 100000;
+        center <300, 180, 60>;
+    }
+    point
+    {
+        step 120000;
+        center <300, 180, 55>;
+    }
+    point
+    {
+        step 140000;
+        center <300, 180, 50>;
+    }
+    point
+    {
+        step 160000;
+        center <300, 180, 45>;
+    }
+    point
+    {
+        step 180000;
+        center <300, 180, 40>;
+    }
+    point
+    {
+        step 200000;
+        center <300, 180, 40>;
+    }
+}
+// Reason for edit end: switch the example prm from the Phase 2 stationary sphere to a Phase 3 kinematic sphere test while keeping the static urban obstacle block unchanged.
 
 Boundaries
 {
-    setup                   Open;
+    setup                   FreeSlip;
 
-    inflowType              periodic; // periodic, shiftedPeriodic, logLawInflow, uniformInflow
-    outflowType             periodic;
+    inflowType              logLawInflow; // periodic, shiftedPeriodic, logLawInflow, uniformInflow
+    outflowType             outflow;
 
     inflowVelocity          <0.05, 0, 0>; // Only applicable if inflowType is set uniformInflow
     outflowPressure         1.0; //not used in this application
 
-        wallType                WFB; // 1 WFB 2 NoSlip
-        topBoundaryType        slip; // symmetry/slip/outflow
+        wallType                NoSlip; // ignored for FreeSlip setup, kept for compatibility
+        topBoundaryType         slip; // symmetry/slip/outflow
         topDampingHeight        0; // cells below the top boundary; 0 disables damping
         topDampingMaxStrength   0.02; // LU relaxation strength at the top cell
         topDampingHorizontal    true; // relax u,v toward the running mean field
