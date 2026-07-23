@@ -1,7 +1,7 @@
 DomainSetup
 {
-    domainSize    <150, 150, 75>;
-    cellsPerBlock <150, 150, 75>;
+    domainSize    <960, 360, 192>;
+    cellsPerBlock <480, 360, 192>;
 
     loadSnapshot    0;
     storeSnapshot   0;
@@ -17,26 +17,26 @@ DomainSetup
 
 Parameters
 {
-    timesteps          2400000;
+    timesteps          20000;
 
-    length_SI             20;
-    length_LU              150;
+    length_SI             1.54;
+    length_LU             240;
 
-    velocity_SI            185;
-    velocity_LU            1;
+    velocity_SI           21.2;
+    velocity_LU            0.122574545;
 
     viscosity_SI           0.00001776;
     density_SI             1.225;
 
     remainingTimeLoggerFrequency 60; // in seconds
 
-    roughnessLengthRatio 0.0000277778;// 0.000027536
-    referenceHeight_LU   81;
-    samplingHeight_LU    12;
+    roughnessLengthRatio 0.02688172;
+    referenceHeight_LU   29;
+    samplingHeight_LU    6;
 
     compressible           true; // Read by LBMGeneration.py at code-generation time (rebuild required after changes)
 
-    driverType          pressureGradient; //none, pressureGradient, dynamicPressureGradient, coriolisForce
+    driverType          none; //none, pressureGradient, dynamicPressureGradient, coriolisForce
     coriolisFrequency   0.0001; // given in s^-1; Only applicable if drivertype is coriolisForce
     geostrophicWind     <0, 0, 0>; // given in m*s^-1, the third component should ALWAYS be 0; Only applicable if drivertype is coriolisForce
     windDirectionDegrees 0; // Only applicable if drivertype is pressureGradient
@@ -50,7 +50,7 @@ Initialisation {
     initialVelocity <0.122574545, 0, 0>; // Used to calculate friction velocity
 }
 
-// Reason for edit start: switch the example prm from the Phase 2 stationary sphere to a Phase 3 kinematic sphere test while keeping the static urban obstacle block unchanged.
+// Reason for edit start: Phase 4e is being switched from the hub-plus-one-blade prototype to a symmetric hub-plus-three-blade rotor so the current assembly-centering logic has a better-behaved rotor-only test before the later rotation-center code fix.
 MesaPD
 {
     enabled true;
@@ -60,55 +60,53 @@ MesaPD
 PSM
 {
     enabled true;
-    phase1ScaffoldOnly false; // Keep this false for the real Phase 3 runtime path
+    phase1ScaffoldOnly false; // Keep this false for the real Phase 4 runtime path
 }
 
 MovingBody
 {
     enabled true;
-    mode kinematic; // Phase 3 currently supports only a kinematic sphere
-    representation sphere; // Phase 3 currently supports only sphere
-    radius 8;
-    initialPosition <800, 180, 50>;
-    initialVelocity <0, 0, 0>; // Used only when no trajectory keyframes are provided
+    mode kinematic; // Phase 4 still uses prescribed kinematics rather than force-driven motion
+    representation convex_polyhedron; // convex_polyhedron, box, sphere ---- Phase 4e can now use one or more convex mesh pieces under one rigid-body motion
+    radius 8; // Used only when representation = sphere
+    boxEdgeLength <30, 90, 90>; // Phase 4e hub-plus-three-blade envelope: keeps the rotor disk compact enough to remain safely inside the current domain
+    piece
+    {
+        meshFile "/home/yanpersonalresearch/walberla/turbine-core/apps/ABLApp_gpu_uniform/phase4e_rotor_assets/blade_hub_phase4e_rotor_aligned.stl"; // Phase 4e rotor-only piece 1: aligned hub in the shared local rotor frame
+        offset <0, 0, 0>;
+    }
+    piece
+    {
+        meshFile "/home/yanpersonalresearch/walberla/turbine-core/apps/ABLApp_gpu_uniform/phase4e_rotor_assets/matt_bladerev5_phase4e_rotor3_blade_a.stl"; // Phase 4e rotor-only piece 2: blade A in the shared local rotor frame
+        offset <0, 0, 0>;
+    }
+    piece
+    {
+        meshFile "/home/yanpersonalresearch/walberla/turbine-core/apps/ABLApp_gpu_uniform/phase4e_rotor_assets/matt_bladerev5_phase4e_rotor3_blade_b.stl"; // Phase 4e rotor-only piece 3: blade B pre-rotated by 120 degrees around the rotor axis
+        offset <0, 0, 0>;
+    }
+    piece
+    {
+        meshFile "/home/yanpersonalresearch/walberla/turbine-core/apps/ABLApp_gpu_uniform/phase4e_rotor_assets/matt_bladerev5_phase4e_rotor3_blade_c.stl"; // Phase 4e rotor-only piece 4: blade C pre-rotated by 240 degrees around the rotor axis
+        offset <0, 0, 0>;
+    }
+    initialPosition <300, 180, 75>; // Fixed-center case: lifted slightly so the convex-assembly interaction radius remains inside the domain in z
+    initialVelocity <0, 0, 0>; // Fixed-center case: no translational motion
+    initialRotation <0, 0, 0>; // Rotation-vector units: rad; the aligned STL assets already place the rotor axis along X
+    angularVelocity <0.0005, 0, 0>; // Fixed-center case: spin the rotor about its local X axis
 }
 
 Trajectory
 {
-    type piecewise_linear; // Phase 3 interpolates the sphere center between these keyframes
+    type piecewise_linear; // With one keyframe the moving body stays fixed at the prescribed center
 
     point
     {
-        step 100000;
-        center <300, 180, 60>;
-    }
-    point
-    {
-        step 120000;
-        center <300, 180, 55>;
-    }
-    point
-    {
-        step 140000;
-        center <300, 180, 50>;
-    }
-    point
-    {
-        step 160000;
-        center <300, 180, 45>;
-    }
-    point
-    {
-        step 180000;
-        center <300, 180, 40>;
-    }
-    point
-    {
-        step 200000;
-        center <300, 180, 40>;
+        step 0;
+        center <300, 180, 75>;
     }
 }
-// Reason for edit end: switch the example prm from the Phase 2 stationary sphere to a Phase 3 kinematic sphere test while keeping the static urban obstacle block unchanged.
+// Reason for edit end: Phase 4e is being switched from the hub-plus-one-blade prototype to a symmetric hub-plus-three-blade rotor so the current assembly-centering logic has a better-behaved rotor-only test before the later rotation-center code fix.
 
 Boundaries
 {
@@ -131,18 +129,11 @@ Boundaries
     elementDistance 0;
     elementLength 0;
 
-Body
-{
-    shape box;
-    min   <374, 165, 0>;
-    max   <614, 195, 29>;
-    flag WFB Flag;
-}
 }
 
 StabilityChecker
 {
-    checkFrequency 100;
+    checkFrequency 1000;
     streamOutput   false;
     vtkOutput      true;
 }
@@ -152,48 +143,38 @@ Output
     welfordInterval 1000;
     VTK
     {
-        writeFrequency 5000;
-        startTimestep  27000;
+        writeFrequency 500;
+        startTimestep  10000;
         ghostLayers    0;
         samplingDx 1;
         samplingDy 1;
         samplingDz 1;
 
-        baseFolder           vtk_out_Juergen Rauleder_paper_reduced_box_960x360x192_Test_9_obstacle_WFB;
+        
+        // Reason for edit start: Phase 4e hub-plus-three-blade runs need their own output folder so they stay separate from both the one-piece hull and the earlier one-blade rotor experiments.
+        baseFolder           vtk_out_Juergen_Rauleder_paper_ABL_and_MesaPD_phase_4e_rotor_only_hub_plus_3_blades;
+        // Reason for edit end: Phase 4e hub-plus-three-blade runs need their own output folder so they stay separate from both the one-piece hull and the earlier one-blade rotor experiments.
         executionFolder      simulation_step;
-
-    inclusion_filters
+inclusion_filters
     {
         DynamicAABB
         {
             trajectoryType piecewise_linear;
             limitMode clamp;
-            center0 <445, 180, 40>;
-            size0 <350, 140, 80>;
+            center0 <300, 180, 75>;
+            size0 <200, 140, 140>;
 
-            point
-            {
-                step 2700;
-                center <550, 180, 40>;
-            }
+        point
+        {
+            step 0;
+            center <300, 180, 75>;
+        }
 
-            point
-            {
-                step 3050;
-                center <650, 180, 40>;
-            }
-
-            point
-            {
-                step 3400;
-                center <750, 180, 40>;
-            }
-
-            point
-            {
-                step 3750;
-                center <445, 180, 40>;
-            }
+        point
+        {
+            step 20000;
+            center <300, 180, 75>;
+        }
         }
     }
 
@@ -230,6 +211,6 @@ Output
         }
 
         outputFrequency  5;
-        startingTimeStep 26950;
+        startingTimeStep 10000;
     }
 }

@@ -1,27 +1,10 @@
-from dataclasses import replace
-
-# This is added to allow reading parameters from input.prm file to set compressibility of the flow. The function looks for a parameter named "compressible" in the input.prm file and parses its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True.
-from pathlib import Path
-import re
-# The above imports are added to allow reading parameters from input.prm file to set compressibility of the flow. The function looks for a parameter named "compressible" in the input.prm file and parses its value as a boolean. If the parameter is not found or cannot be parsed, it defaults to True.
-
 import pystencils as ps
-import numpy as np
 import sympy as sp
 from lbmpy.macroscopic_value_kernels import pdf_initialization_assignments, macroscopic_values_getter
 from lbmpy.flow_statistics import welford_assignments
 from lbmpy.utils import second_order_moment_tensor
-from pystencils import Target
-from pystencils.fast_approximation import insert_fast_sqrts, insert_fast_divisions
-from pystencils.typing import TypedSymbol
-from lbmpy.creationfunctions import create_lb_collision_rule
 from lbmpy.advanced_streaming import Timestep, get_timesteps
-from lbmpy.advanced_streaming.utility import is_inplace
 from lbmpy.boundaries import NoSlip, FreeSlip, UBB, ExtrapolationOutflow, WallFunctionBounce, MoninObukhovSimilarityTheory
-from lbmpy_walberla.additional_data_handler import UBBAdditionalDataHandler
-from lbmpy_walberla import generate_alternating_lbm_boundary
-from lbmpy import LBMConfig, LBMOptimisation, LBStencil, Method, Stencil, ForceModel
-from lbmpy.turbulence_models import SubgridScaleModel
 
 from pystencils_walberla import CodeGeneration, generate_info_header, generate_sweep
 from lbmpy_walberla import generate_lbm_package, lbm_boundary_generator
@@ -91,14 +74,14 @@ with CodeGeneration() as ctx:
             field_access @= sp.Float(0)
 
     generate_sweep(ctx, "waLBerlaABL_SoSResetter", ps.AssignmentCollection(sos_resetter), target=target,
-                   gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
+                   gpu_indexing_params=GPU_INDEXING_PARAMS, max_threads=MAX_THREADS)
 
     welford_nut_update = welford_assignments(field=eddy_viscosity_field, mean_field=mean_eddy_viscosity_field)
     generate_sweep(ctx, "waLBerlaABL_WelfordEddyViscosity", welford_nut_update, target=target,
-                   gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
+                   gpu_indexing_params=GPU_INDEXING_PARAMS, max_threads=MAX_THREADS)
     welford_strain_update = welford_assignments(field=strain_rate_field, mean_field=mean_strain_rate_field)
     generate_sweep(ctx, "waLBerlaABL_WelfordStrainRate", welford_strain_update, target=target,
-                   gpu_indexing_params=gpu_indexing_params, max_threads=max_threads)
+                   gpu_indexing_params=GPU_INDEXING_PARAMS, max_threads=MAX_THREADS)
 
     # PDF Setter -> used for initialisation before 0th timestep (CPU side)
     initial_rho = sp.Symbol('rho_0')

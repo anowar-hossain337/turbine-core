@@ -1,9 +1,9 @@
-<!-- Reason for edit start: document the full Phase 1 to Phase 3 MesaPD/PSM integration in one developer-facing note so the app structure, file edits, and runtime flow are easy to understand later. -->
+<!-- Reason for edit start: document the full Phase 1 to Phase 4 MesaPD/PSM integration in one developer-facing note so the app structure, file edits, and runtime flow are easy to understand later. -->
 # MesaPD + PSM Developer Note
 
 ## 1. Purpose
 
-This note documents the MesaPD and PSM integration that was added to `ABLApp_gpu_uniform` from the initial scaffold up to the current Phase 3 moving-sphere setup.
+This note documents the MesaPD and PSM integration that was added to `ABLApp_gpu_uniform` from the initial scaffold up to the current Phase 4 moving-body setup.
 
 The goal of the work was:
 
@@ -29,7 +29,7 @@ This means:
 
 - no separate application is required
 - switching `PSM.enabled` on or off does not require a rebuild
-- static urban obstacles and the moving sphere can coexist in the same run
+- static urban obstacles and the moving body can coexist in the same run
 
 ## 4. Phase Summary
 
@@ -72,6 +72,20 @@ Outcome:
 - the sphere state is updated every timestep
 - the static urban box still comes from the normal boundary path
 - the moving sphere comes from MesaPD + PSM
+
+### Phase 4
+
+Purpose:
+
+- extend the kinematic moving-body path from a sphere-only case to a sphere-or-box case
+- add prescribed rotation through a constant angular-velocity input
+- keep the existing static urban box obstacle active
+
+Outcome:
+
+- the moving object can now be a sphere, box, or cube alias
+- the body orientation is updated every timestep together with the translation state
+- the original ABL branch and the Phase 3 sphere path remain available through prm settings
 
 ## 5. Files Edited And Why
 
@@ -158,6 +172,7 @@ What changed:
   - `MovingBody`
   - `Trajectory`
 - in Phase 3, extended parsing to store sorted trajectory keyframes as real data
+- in Phase 4, added `boxEdgeLength`, `initialRotation`, and `angularVelocity`
 
 Why it matters:
 
@@ -173,7 +188,7 @@ What changed:
 
 - added early validation of MesaPD / PSM / MovingBody config
 - added optional MesaPD particle storage, shape storage, accessor, and PSM helper objects
-- added one sphere creation path
+- added one moving-body creation path with sphere and box support
 - added PSM initialization sweeps before timestep 0
 - added a timeloop branch:
   - legacy ABL stream-collide if PSM is off
@@ -182,10 +197,14 @@ What changed:
   - added moving-sphere state evaluation
   - added trajectory interpolation
   - added per-timestep sphere position and velocity update before particle mapping
+- in Phase 4:
+  - generalized the sphere state into a moving-body state
+  - added box and cube-alias support through MesaPD `Box`
+  - added per-timestep body rotation and angular-velocity updates before particle mapping
 
 Why it matters:
 
-- this file is the runtime dispatcher and the real integration point between the ABL solver, the static obstacle path, and the moving MesaPD sphere
+- this file is the runtime dispatcher and the real integration point between the ABL solver, the static obstacle path, and the moving MesaPD body
 
 ### `ABLApp_gpu_uniform/input.prm`
 
@@ -202,6 +221,7 @@ What changed:
   - `Trajectory { ... }`
 - kept the existing static obstacle definition under `Boundaries -> Body`
 - in Phase 3, added multiple trajectory keyframes and adjusted VTK output cadence for visible motion
+- in Phase 4, switched the example to a kinematic rotating cube case
 
 Why it matters:
 
@@ -244,7 +264,7 @@ The connection chain is:
 
 7. `main.cu`
    - decides which runtime branch to execute
-   - allocates and updates the MesaPD sphere
+   - allocates and updates the MesaPD moving body
    - runs the PSM sweep sequence when enabled
 
 ## 8. Runtime Application Flow
@@ -263,6 +283,7 @@ At startup:
 
 - `main.cu` reads `input.prm`
 - `MovingBodyConfig.h` parses the optional MesaPD / PSM / MovingBody / Trajectory blocks
+- `MovingBodyConfig.h` also reads the optional box-size and rotational controls for Phase 4
 - the app checks whether the moving-body branch is:
   - fully disabled
   - partially enabled by mistake
@@ -279,10 +300,10 @@ If the moving-body feature is off:
 
 If the moving-body feature is on:
 
-- `main.cu` creates one MesaPD sphere
+- `main.cu` creates one MesaPD moving body
 - PSM helper fields are allocated
-- the sphere is mapped into the fluid domain
-- PDFs in intersecting cells are initialized consistently with the sphere state
+- the body is mapped into the fluid domain
+- PDFs in intersecting cells are initialized consistently with the moving-body state
 
 Then the timeloop uses:
 
@@ -295,29 +316,31 @@ instead of the single normal ABL stream-collide step
 
 ### Static And Moving Obstacles Together
 
-The static urban object and the moving sphere are handled by different mechanisms:
+The static urban object and the moving body are handled by different mechanisms:
 
 - static urban box:
   - comes from `Boundaries -> Body`
   - handled through the standard generated boundary / flag-field path
 
-- moving sphere:
+- moving body:
   - comes from MesaPD particle storage
   - coupled through PSM
 
 This separation is why they can coexist in the same simulation.
 
-## 9. Phase 3 Motion Logic
+## 9. Phase 4 Motion Logic
 
-In the current Phase 3 version:
+In the current Phase 4 version:
 
-- the sphere is kinematic
-- only `representation sphere` is supported
-- the trajectory is read from `Trajectory -> point` blocks
+- the body is kinematic
+- `representation sphere`, `representation box`, and `representation cube` are supported
+- the translation trajectory is read from `Trajectory -> point` blocks
 - points are sorted by timestep
-- the sphere center is interpolated linearly between keyframes
-- the velocity is computed from the active segment
-- the sphere state is applied before the PSM particle-mapping sweep each timestep
+- the body center is interpolated linearly between keyframes
+- the linear velocity is computed from the active segment
+- the orientation starts from `MovingBody.initialRotation`
+- the orientation is advanced from `MovingBody.angularVelocity`
+- the body state is applied before the PSM particle-mapping sweep each timestep
 
 ## 10. Important User Controls In `input.prm`
 
@@ -335,8 +358,11 @@ These must be consistent. The real coupling path expects all three main feature 
 - `MovingBody.mode`
 - `MovingBody.representation`
 - `MovingBody.radius`
+- `MovingBody.boxEdgeLength`
 - `MovingBody.initialPosition`
 - `MovingBody.initialVelocity`
+- `MovingBody.initialRotation`
+- `MovingBody.angularVelocity`
 
 ### Trajectory definition
 
@@ -355,9 +381,10 @@ These must be consistent. The real coupling path expects all three main feature 
 The current implementation is intentionally narrow:
 
 - one moving object
-- sphere representation
+- sphere or box representation
 - kinematic motion
 - trajectory from prm keyframes
+- prescribed constant angular velocity from prm
 
 It is not yet a general rigid-body framework for arbitrary aircraft geometry.
 
@@ -370,5 +397,5 @@ The final design should be understood like this:
 - the moving-body path was introduced gradually so the original numerics stayed available from the beginning
 - the static urban obstacle path was preserved instead of being replaced
 
-That was the main design intention throughout all three phases.
-<!-- Reason for edit end: document the full Phase 1 to Phase 3 MesaPD/PSM integration in one developer-facing note so the app structure, file edits, and runtime flow are easy to understand later. -->
+That was the main design intention throughout all four phases.
+<!-- Reason for edit end: document the full Phase 1 to Phase 4 MesaPD/PSM integration in one developer-facing note so the app structure, file edits, and runtime flow are easy to understand later. -->

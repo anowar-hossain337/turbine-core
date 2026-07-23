@@ -14,3 +14,4 @@ add_subdirectory(GeneratedApp_gpu_uniform)
 add_subdirectory(ABLApp_cpu_staticRefinement)
 
 add_subdirectory(ABLApp_gpu_uniform)
+add_subdirectory(ABLApp_gpu_NonUniform)

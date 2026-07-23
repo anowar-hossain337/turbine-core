@@ -1,7 +1,9 @@
 // Reason for edit start: add the standard-library helpers needed to validate the new top-boundary option without changing the existing Open/WFB configuration flow.
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <cmath>
 #include <string>
@@ -41,28 +43,35 @@
 #include "walberla_helper/field/all.h"
 #include "wind_turbine_core/ProjectDefines.h"
 
-// Reason for edit start: include the MesaPD and PSM runtime helpers so one optional Phase 3 kinematic sphere can be coupled on top of the existing static-obstacle ABL path when explicitly enabled.
+// Reason for edit start: include the MesaPD and PSM runtime helpers so one optional Phase 4 kinematic sphere or box can be coupled on top of the existing static-obstacle ABL path when explicitly enabled.
 #include "lbm_mesapd_coupling/DataTypesCodegen.h"
 #include "lbm_mesapd_coupling/partially_saturated_cells_method/codegen/PSMSweepCollection.h"
 #include "lbm_mesapd_coupling/utility/ParticleSelector.h"
 #include "lbm_mesapd_coupling/utility/ResetHydrodynamicForceTorqueKernel.h"
+#ifdef WALBERLA_MESAPD_CONVEX_POLYHEDRON_AVAILABLE
+#include "mesh_common/MeshOperations.h"
+#include "mesh_common/QHull.h"
+#include "mesh_common/TriangleMeshes.h"
+#endif
 #include "mesa_pd/data/ParticleAccessorWithShape.h"
 #include "mesa_pd/data/ParticleStorage.h"
 #include "mesa_pd/data/ShapeStorage.h"
+#include "mesa_pd/data/shape/Box.h"
+#include "mesa_pd/data/shape/ConvexPolyhedron.h"
 #include "mesa_pd/data/shape/Sphere.h"
 #include "mesa_pd/kernel/ParticleSelector.h"
 #include "waLBerlaABLPSM_InitializeDomainForPSM.h"
 #include "waLBerlaABLPSM_Sweep.h"
-// Reason for edit end: include the MesaPD and PSM runtime helpers so one optional Phase 3 kinematic sphere can be coupled on top of the existing static-obstacle ABL path when explicitly enabled.
+// Reason for edit end: include the MesaPD and PSM runtime helpers so one optional Phase 4 kinematic sphere or box can be coupled on top of the existing static-obstacle ABL path when explicitly enabled.
 
-// Reason for edit start: include the shared moving-body config parser and both generated kernel-info headers so the app can validate and log the legacy ABL path and the optional Phase 3 PSM path from prm settings.
+// Reason for edit start: include the shared moving-body config parser and both generated kernel-info headers so the app can validate and log the legacy ABL path and the optional Phase 4 PSM path from prm settings.
 #include "MovingBodyConfig.h"
 #include "TopDampingZone.h"
 #include "TopSlipZeroGradientBoundary.h"
 #include "waLBerlaABL_KernelInfo.h"
 #include "waLBerlaABLPSM_KernelInfo.h"
 #include "FlowDriverCollection.h"
-// Reason for edit end: include the shared moving-body config parser and both generated kernel-info headers so the app can validate and log the legacy ABL path and the optional Phase 3 PSM path from prm settings.
+// Reason for edit end: include the shared moving-body config parser and both generated kernel-info headers so the app can validate and log the legacy ABL path and the optional Phase 4 PSM path from prm settings.
 
 namespace turbine_core {
 
@@ -84,7 +93,7 @@ int main(int argc, char** argv) {
 
     auto globalConfig = walberlaEnv.config();
     auto parameters = globalConfig->getOneBlock("Parameters");
-    // Reason for edit start: normalize prm tokens once so the optional Phase 3 moving-body checks and the existing top-boundary checks can share the same case-insensitive parsing logic.
+    // Reason for edit start: normalize prm tokens once so the optional Phase 4 moving-body checks and the existing top-boundary checks can share the same case-insensitive parsing logic.
     const auto normalizeConfigToken = [](std::string value) {
         value.erase(std::remove_if(value.begin(), value.end(),
                                    [](unsigned char ch) { return std::isspace(ch) != 0; }),
@@ -93,9 +102,9 @@ int main(int argc, char** argv) {
                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
         return value;
     };
-    // Reason for edit end: normalize prm tokens once so the optional Phase 3 moving-body checks and the existing top-boundary checks can share the same case-insensitive parsing logic.
+    // Reason for edit end: normalize prm tokens once so the optional Phase 4 moving-body checks and the existing top-boundary checks can share the same case-insensitive parsing logic.
 
-    // Reason for edit start: validate the optional Phase 3 kinematic-sphere path early so the default urban ABL run stays unchanged unless all three feature toggles are enabled together.
+    // Reason for edit start: validate the optional Phase 4 kinematic moving-body path early so the default urban ABL run stays unchanged unless the full MesaPD, PSM, and moving-body stack is enabled together.
     const moving_body::RuntimeConfig movingBodyRuntimeConfig = moving_body::loadRuntimeConfig(globalConfig);
     const bool psmCouplingRequested = movingBodyRuntimeConfig.anyFeatureEnabled();
     const bool psmCouplingEnabled =
@@ -107,55 +116,202 @@ int main(int argc, char** argv) {
             normalizeConfigToken(movingBodyRuntimeConfig.body.representation);
     const std::string movingBodyTrajectoryTypeName =
             normalizeConfigToken(movingBodyRuntimeConfig.body.trajectoryType);
+    const bool movingBodyIsSphere = movingBodyRepresentationName == "sphere";
+    const bool movingBodyIsBoxLike =
+            movingBodyRepresentationName == "box" || movingBodyRepresentationName == "cube";
+    // Reason for edit start: Phase 4c adds a third moving-body representation token so one hard-coded convex-polyhedron prototype can be exercised through the existing prm-driven moving-body path before mesh-file loading is introduced later.
+    const bool movingBodyIsConvexPolyhedron =
+            movingBodyRepresentationName == "convex_polyhedron" ||
+            movingBodyRepresentationName == "convexpolyhedron" ||
+            movingBodyRepresentationName == "polyhedron";
+    // Reason for edit end: Phase 4c adds a third moving-body representation token so one hard-coded convex-polyhedron prototype can be exercised through the existing prm-driven moving-body path before mesh-file loading is introduced later.
+    // Reason for edit start: Phase 4d resolves an optional mesh filename from prm against both the run directory and the executable directory so convex-polyhedron test meshes can be dropped beside the built app without hard-coded absolute paths.
+    const auto resolveMovingBodyMeshFile = [&](const std::string & meshFile) {
+        namespace fs = std::filesystem;
+        if (meshFile.empty()) {
+            return fs::path{};
+        }
+
+        const fs::path configuredPath(meshFile);
+        std::error_code ec;
+        if (configuredPath.is_absolute()) {
+            return configuredPath;
+        }
+
+        if (fs::exists(configuredPath, ec)) {
+            return fs::absolute(configuredPath, ec);
+        }
+
+        ec.clear();
+        const fs::path executablePath = fs::absolute(fs::path(argv[0]), ec);
+        const fs::path executableDir =
+                executablePath.has_parent_path() ? executablePath.parent_path() : fs::current_path(ec);
+        const fs::path executableRelativePath = executableDir / configuredPath;
+        if (fs::exists(executableRelativePath, ec)) {
+            const fs::path normalizedPath = fs::weakly_canonical(executableRelativePath, ec);
+            return ec ? executableRelativePath.lexically_normal() : normalizedPath;
+        }
+
+        return configuredPath;
+    };
+    const std::filesystem::path movingBodyMeshFilePath =
+            resolveMovingBodyMeshFile(movingBodyRuntimeConfig.body.meshFile);
+    const bool movingBodyUsesMeshFile =
+            movingBodyIsConvexPolyhedron && !movingBodyRuntimeConfig.body.meshFile.empty();
+    // Reason for edit start: Phase 4e resolves every optional convex-piece mesh file through the same relative-path rules as the older single-mesh path so prm-selected multi-piece assemblies can be launched from the build folder without absolute paths.
+    std::vector< std::filesystem::path > movingBodyPieceMeshFilePaths{};
+    movingBodyPieceMeshFilePaths.reserve(movingBodyRuntimeConfig.body.convexPieces.size());
+    for (const auto & convexPiece : movingBodyRuntimeConfig.body.convexPieces) {
+        movingBodyPieceMeshFilePaths.push_back(resolveMovingBodyMeshFile(convexPiece.meshFile));
+    }
+    const bool movingBodyUsesMeshPieces =
+            movingBodyIsConvexPolyhedron && !movingBodyRuntimeConfig.body.convexPieces.empty();
+    // Reason for edit end: Phase 4e resolves every optional convex-piece mesh file through the same relative-path rules as the older single-mesh path so prm-selected multi-piece assemblies can be launched from the build folder without absolute paths.
+    // Reason for edit end: Phase 4d resolves an optional mesh filename from prm against both the run directory and the executable directory so convex-polyhedron test meshes can be dropped beside the built app without hard-coded absolute paths.
     if (psmCouplingRequested && !psmCouplingEnabled) {
-        WALBERLA_ABORT("Phase 3 moving-body coupling requires MesaPD::enabled, PSM::enabled, and MovingBody::enabled to all be true together.")
+        WALBERLA_ABORT("Phase 4 moving-body coupling requires MesaPD::enabled, PSM::enabled, and MovingBody::enabled to all be true together.")
     }
     if (psmCouplingEnabled) {
         WALBERLA_CHECK(!movingBodyRuntimeConfig.psm.phase1ScaffoldOnly,
-                       "Phase 3 runtime coupling requires PSM::phase1ScaffoldOnly = false.")
+                       "Phase 4 runtime coupling requires PSM::phase1ScaffoldOnly = false.")
         WALBERLA_CHECK(movingBodyModeName == "kinematic",
-                       "Phase 3 currently supports only MovingBody::mode = kinematic.")
-        WALBERLA_CHECK(movingBodyRepresentationName == "sphere",
-                       "Phase 3 currently supports only MovingBody::representation = sphere.")
-        WALBERLA_CHECK_GREATER(movingBodyRuntimeConfig.body.radius, real_t(0),
-                               "MovingBody::radius must be positive.")
+                       "Phase 4 currently supports only MovingBody::mode = kinematic.")
+        WALBERLA_CHECK(movingBodyIsSphere || movingBodyIsBoxLike || movingBodyIsConvexPolyhedron,
+                       "Phase 4 currently supports only MovingBody::representation = sphere, box, cube, or convex_polyhedron.")
+        if (movingBodyIsSphere) {
+            WALBERLA_CHECK_GREATER(movingBodyRuntimeConfig.body.radius, real_t(0),
+                                   "MovingBody::radius must be positive when representation = sphere.")
+        } else {
+            for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+                WALBERLA_CHECK_GREATER(movingBodyRuntimeConfig.body.boxEdgeLength[d], real_t(0),
+                                       "MovingBody::boxEdgeLength components must be positive when representation = box, cube, or convex_polyhedron.")
+            }
+            // Reason for edit start: Phase 4b removes the Phase 4a axis-aligned-only restriction so the rotating-box mapper can use the particle orientation already maintained by the kinematic moving-body state.
+            // Reason for edit end: Phase 4b removes the Phase 4a axis-aligned-only restriction so the rotating-box mapper can use the particle orientation already maintained by the kinematic moving-body state.
+        }
+#ifndef WALBERLA_MESAPD_CONVEX_POLYHEDRON_AVAILABLE
+        // Reason for edit start: Phase 4c fails fast when the convex-polyhedron prototype is requested from prm but the underlying waLBerla build has no OpenMesh-backed ConvexPolyhedron support.
+        WALBERLA_CHECK(!movingBodyIsConvexPolyhedron,
+                       "Phase 4c convex-polyhedron mapping requires waLBerla to be built with OpenMesh support.")
+        // Reason for edit end: Phase 4c fails fast when the convex-polyhedron prototype is requested from prm but the underlying waLBerla build has no OpenMesh-backed ConvexPolyhedron support.
+#endif
+        // Reason for edit start: Phase 4d validates the optional mesh-file path early so missing STL inputs fail before the expensive field and GPU setup begins.
+        if (movingBodyIsConvexPolyhedron) {
+            // Reason for edit start: Phase 4e keeps the older single-mesh hull path available, but rejects ambiguous prm input where both one `meshFile` and one or more `piece` blocks are specified at the same time.
+            WALBERLA_CHECK(!(movingBodyUsesMeshFile && movingBodyUsesMeshPieces),
+                           "Phase 4e convex-polyhedron input must use either MovingBody::meshFile or one or more MovingBody::piece blocks, but not both.")
+            // Reason for edit end: Phase 4e keeps the older single-mesh hull path available, but rejects ambiguous prm input where both one `meshFile` and one or more `piece` blocks are specified at the same time.
+        }
+        if (movingBodyUsesMeshFile) {
+            WALBERLA_CHECK(std::filesystem::exists(movingBodyMeshFilePath),
+                           "Phase 4d convex-polyhedron mesh file could not be found: "
+                           << movingBodyRuntimeConfig.body.meshFile)
+        }
+        // Reason for edit start: Phase 4e validates every configured convex-piece mesh file before the expensive GPU setup begins so missing multi-piece inputs fail fast and point to the exact broken piece path.
+        if (movingBodyUsesMeshPieces) {
+            for (size_t pieceIdx = size_t(0); pieceIdx < movingBodyPieceMeshFilePaths.size(); ++pieceIdx) {
+                WALBERLA_CHECK(std::filesystem::exists(movingBodyPieceMeshFilePaths[pieceIdx]),
+                               "Phase 4e convex-polyhedron mesh piece could not be found: "
+                               << movingBodyRuntimeConfig.body.convexPieces[pieceIdx].meshFile)
+            }
+        }
+        // Reason for edit end: Phase 4e validates every configured convex-piece mesh file before the expensive GPU setup begins so missing multi-piece inputs fail fast and point to the exact broken piece path.
+        // Reason for edit end: Phase 4d validates the optional mesh-file path early so missing STL inputs fail before the expensive field and GPU setup begins.
         if (movingBodyRuntimeConfig.body.trajectoryPointCount > uint_t(1)) {
             WALBERLA_CHECK(movingBodyTrajectoryTypeName == "piecewise_linear",
-                           "Phase 3 currently supports only Trajectory::type = piecewise_linear.")
+                           "Phase 4 currently supports only Trajectory::type = piecewise_linear.")
         }
 
-        WALBERLA_LOG_INFO_ON_ROOT("MesaPD/PSM Phase 3 kinematic-sphere coupling enabled.")
+        WALBERLA_LOG_INFO_ON_ROOT("MesaPD/PSM Phase 4 kinematic moving-body coupling enabled.")
         WALBERLA_LOG_INFO_ON_ROOT("PSM runtime numerics: stencil = " << codegen::psm::KernelInfo::stencil
                                   << ", method = " << codegen::psm::KernelInfo::method
                                   << ", forceModel = " << codegen::psm::KernelInfo::forceModel
                                   << ", maxParticlesPerCell = " << codegen::psm::KernelInfo::maxParticlesPerCell)
+        if (movingBodyIsSphere) {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body representation: sphere, radius = "
+                                      << movingBodyRuntimeConfig.body.radius)
+        } else if (movingBodyIsConvexPolyhedron) {
+            // Reason for edit start: Phase 4d logs whether the convex-polyhedron body comes from the legacy prototype or from a file-loaded single convex hull so the run mode is unambiguous in the console output.
+            if (movingBodyUsesMeshPieces) {
+                WALBERLA_LOG_INFO_ON_ROOT("Moving body representation: " << movingBodyRuntimeConfig.body.representation
+                                          << ", convex mesh pieces = " << movingBodyPieceMeshFilePaths.size()
+                                          << ", assembly fit boxEdgeLength = "
+                                          << movingBodyRuntimeConfig.body.boxEdgeLength)
+            } else if (movingBodyUsesMeshFile) {
+                WALBERLA_LOG_INFO_ON_ROOT("Moving body representation: " << movingBodyRuntimeConfig.body.representation
+                                          << ", meshFile = " << movingBodyMeshFilePath.string()
+                                          << ", single-convex-hull fit boxEdgeLength = "
+                                          << movingBodyRuntimeConfig.body.boxEdgeLength)
+            } else {
+                WALBERLA_LOG_INFO_ON_ROOT("Moving body representation: " << movingBodyRuntimeConfig.body.representation
+                                          << ", prototype control boxEdgeLength = "
+                                          << movingBodyRuntimeConfig.body.boxEdgeLength)
+            }
+            // Reason for edit end: Phase 4d logs whether the convex-polyhedron body comes from the legacy prototype or from a file-loaded single convex hull so the run mode is unambiguous in the console output.
+        } else {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body representation: " << movingBodyRuntimeConfig.body.representation
+                                      << ", boxEdgeLength = " << movingBodyRuntimeConfig.body.boxEdgeLength)
+        }
 
         if (movingBodyRuntimeConfig.body.trajectoryPointCount > uint_t(1)) {
-            WALBERLA_LOG_INFO_ON_ROOT("Moving sphere trajectory: piecewise-linear keyframes = "
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body translation: piecewise-linear keyframes = "
                                       << movingBodyRuntimeConfig.body.trajectoryPointCount)
         } else if (movingBodyRuntimeConfig.body.trajectoryPointCount == uint_t(1)) {
-            WALBERLA_LOG_INFO_ON_ROOT("Moving sphere trajectory: single keyframe, sphere will stay fixed at "
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body translation: single keyframe, body will stay fixed at "
                                       << movingBodyRuntimeConfig.body.trajectoryPoints.front().center)
         } else if (movingBodyRuntimeConfig.body.initialVelocity.sqrLength() > real_t(0)) {
-            WALBERLA_LOG_INFO_ON_ROOT("Moving sphere trajectory: constant-velocity motion from initialPosition.")
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body translation: constant-velocity motion from initialPosition.")
         } else {
-            WALBERLA_LOG_INFO_ON_ROOT("Moving sphere trajectory: no keyframes and zero initialVelocity, sphere remains stationary.")
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body translation: no keyframes and zero initialVelocity, body remains stationary.")
+        }
+        if (movingBodyRuntimeConfig.body.initialRotation.sqrLength() > real_t(0)) {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body initial rotation vector = "
+                                      << movingBodyRuntimeConfig.body.initialRotation
+                                      << " (rad).")
+        }
+        if (movingBodyRuntimeConfig.body.angularVelocity.sqrLength() > real_t(0)) {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body angular velocity = "
+                                      << movingBodyRuntimeConfig.body.angularVelocity
+                                      << " (rad per timestep).")
+        } else {
+            WALBERLA_LOG_INFO_ON_ROOT("Moving body rotation: zero angular velocity, body keeps its initial orientation.")
         }
         if (movingBodyRuntimeConfig.mesaPD.subcycles != uint_t(1)) {
-            WALBERLA_LOG_INFO_ON_ROOT("MesaPD::subcycles is parsed, but Phase 3 still uses one LBM update per timestep without subcycling.")
+            WALBERLA_LOG_INFO_ON_ROOT("MesaPD::subcycles is parsed, but Phase 4 still uses one LBM update per timestep without subcycling.")
         }
     }
-    // Reason for edit end: validate the optional Phase 3 kinematic-sphere path early so the default urban ABL run stays unchanged unless all three feature toggles are enabled together.
+    // Reason for edit end: validate the optional Phase 4 kinematic moving-body path early so the default urban ABL run stays unchanged unless the full MesaPD, PSM, and moving-body stack is enabled together.
 
-    // Reason for edit start: evaluate the optional Phase 3 kinematic sphere from either a constant velocity or piecewise-linear keyframes so the PSM path can update the particle state every timestep.
-    struct MovingSphereState
+    // Reason for edit start: compute one conservative interaction radius for the Phase 4 moving body so the domain checks and particle mapping stay valid for spheres, rotating boxes, and the Phase 4c convex-polyhedron prototype.
+    real_t movingBodyInteractionRadius = movingBodyRuntimeConfig.body.radius;
+    if (movingBodyIsBoxLike || movingBodyIsConvexPolyhedron) {
+        real_t halfDiagonalSquared = real_t(0);
+        for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+            const real_t halfEdgeLength = real_t(0.5) * movingBodyRuntimeConfig.body.boxEdgeLength[d];
+            halfDiagonalSquared += halfEdgeLength * halfEdgeLength;
+        }
+        movingBodyInteractionRadius = std::sqrt(halfDiagonalSquared);
+    }
+    // Reason for edit end: compute one conservative interaction radius for the Phase 4 moving body so the domain checks and particle mapping stay valid for spheres, rotating boxes, and the Phase 4c convex-polyhedron prototype.
+
+    // Reason for edit start: evaluate the optional Phase 4 kinematic moving body from translation keyframes plus constant angular velocity so the PSM path can update both position and orientation every timestep.
+    struct MovingBodyState
     {
         walberla::Vector3<real_t> center{ real_t(0), real_t(0), real_t(0) };
         walberla::Vector3<real_t> velocity{ real_t(0), real_t(0), real_t(0) };
+        walberla::Vector3<real_t> angularVelocity{ real_t(0), real_t(0), real_t(0) };
+        walberla::Vector3<real_t> accumulatedRotation{ real_t(0), real_t(0), real_t(0) };
+        walberla::mesa_pd::Rot3 rotation{};
     };
 
-    const auto evaluateMovingSphereState = [&](const uint_t step) {
-        MovingSphereState state{};
+    const auto evaluateMovingBodyState = [&](const uint_t step) {
+        MovingBodyState state{};
+        state.angularVelocity = movingBodyRuntimeConfig.body.angularVelocity;
+        state.rotation = walberla::mesa_pd::Rot3(movingBodyRuntimeConfig.body.initialRotation);
+        for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+            state.accumulatedRotation[d] = real_t(step) * state.angularVelocity[d];
+        }
+        state.rotation.rotate(state.accumulatedRotation);
 
         if (movingBodyRuntimeConfig.body.trajectoryPoints.empty()) {
             state.center = movingBodyRuntimeConfig.body.initialPosition;
@@ -187,9 +343,9 @@ int main(int argc, char** argv) {
                 });
 
         WALBERLA_CHECK(upper != movingBodyRuntimeConfig.body.trajectoryPoints.begin(),
-                       "Phase 3 trajectory interpolation requires a lower keyframe.")
+                       "Phase 4 translation interpolation requires a lower keyframe.")
         WALBERLA_CHECK(upper != movingBodyRuntimeConfig.body.trajectoryPoints.end(),
-                       "Phase 3 trajectory interpolation requires an upper keyframe.")
+                       "Phase 4 translation interpolation requires an upper keyframe.")
 
         if (upper->step == step) {
             state.center = upper->center;
@@ -210,7 +366,29 @@ int main(int argc, char** argv) {
         }
         return state;
     };
-    // Reason for edit end: evaluate the optional Phase 3 kinematic sphere from either a constant velocity or piecewise-linear keyframes so the PSM path can update the particle state every timestep.
+    // Reason for edit end: evaluate the optional Phase 4 kinematic moving body from translation keyframes plus constant angular velocity so the PSM path can update both position and orientation every timestep.
+
+    // Reason for edit start: Phase 4e derives one piece center and one piece linear velocity from the shared rigid-body state so several convex particles can move as one assembly without introducing two-way force coupling.
+    struct MovingBodyPieceKinematics
+    {
+        walberla::Vector3<real_t> center{ real_t(0), real_t(0), real_t(0) };
+        walberla::Vector3<real_t> velocity{ real_t(0), real_t(0), real_t(0) };
+    };
+
+    const auto evaluateMovingBodyPieceKinematics =
+            [&](const MovingBodyState & state, const walberla::Vector3<real_t> & localOffset) {
+                MovingBodyPieceKinematics pieceState{};
+                const walberla::Vector3<real_t> rotatedOffset =
+                        state.rotation.getMatrix() * localOffset;
+                const walberla::Vector3<real_t> tangentialVelocity(
+                        state.angularVelocity[1] * rotatedOffset[2] - state.angularVelocity[2] * rotatedOffset[1],
+                        state.angularVelocity[2] * rotatedOffset[0] - state.angularVelocity[0] * rotatedOffset[2],
+                        state.angularVelocity[0] * rotatedOffset[1] - state.angularVelocity[1] * rotatedOffset[0]);
+                pieceState.center = state.center + rotatedOffset;
+                pieceState.velocity = state.velocity + tangentialVelocity;
+                return pieceState;
+            };
+    // Reason for edit end: Phase 4e derives one piece center and one piece linear velocity from the shared rigid-body state so several convex particles can move as one assembly without introducing two-way force coupling.
 
     uint_t timesteps = parameters.getParameter<uint_t>("timesteps", uint_t(10));
     ++timesteps;
@@ -296,6 +474,8 @@ int main(int argc, char** argv) {
     const real_t roughnessLengthRatio = parameters.getParameter<real_t>("roughnessLengthRatio", real_t(1e-4));
     const real_t referenceHeight = parameters.getParameter<real_t>("referenceHeight_LU", real_t(-1));
     const uint32_t samplingHeight = parameters.getParameter<uint32_t>("samplingHeight_LU", uint32_t(0));
+    // Temporary benchmark toggle: Welford sweeps are commented out below.
+    // Keep the welford disabled config lookup here as a comment for easy restoration.
     const uint_t welfordInterval = walberlaEnv.config()->getOneBlock("Output").getParameter<uint_t>("welfordInterval", uint_t(0));
     const real_t roughnessLength = roughnessLengthRatio * referenceHeight;
 
@@ -349,7 +529,7 @@ int main(int argc, char** argv) {
     SweepCollection_T sweepCollection(blocks, densityFieldGpuID, eddyViscosityFieldGpuID, forceFieldGpuID, omegaFieldGpuID,
                                       pdfFieldGpuID, velocityFieldGpuID, omega);
 
-    // Reason for edit start: allocate the optional Phase 3 MesaPD and PSM runtime objects beside the existing GPU solver fields so one kinematic sphere can move through the unchanged urban ABL path.
+    // Reason for edit start: allocate the optional Phase 4 MesaPD and PSM runtime objects beside the existing GPU solver fields so one kinematic sphere or box can move and rotate through the unchanged urban ABL path.
     using ParticleAccessor_T = walberla::mesa_pd::data::ParticleAccessorWithShape;
     using PSMParticleAndVolumeFractionSoA_T =
             walberla::lbm_mesapd_coupling::psm::gpu::ParticleAndVolumeFractionSoA_T<1>;
@@ -366,60 +546,384 @@ int main(int argc, char** argv) {
     std::unique_ptr<walberla::pystencils::waLBerlaABLPSM_Sweep> psmSweep{};
     std::unique_ptr<walberla::pystencils::waLBerlaABLPSM_InitializeDomainForPSM> psmPdfInitializer{};
     walberla::lbm_mesapd_coupling::GlobalParticlesSelector psmGlobalParticleSelector{};
-    walberla::id_t psmSphereUID(0);
+    // Reason for edit start: Phase 4e stores one runtime record per convex mesh piece so the rigid assembly update can move several ConvexPolyhedron particles with one shared center and rotation.
+    struct MovingBodyPieceRuntimeState
+    {
+        walberla::id_t uid{ 0 };
+        walberla::Vector3<real_t> localOffset{ real_t(0), real_t(0), real_t(0) };
+        std::string meshLabel{};
+    };
+    std::vector<MovingBodyPieceRuntimeState> psmMovingBodyPieces{};
+    // Reason for edit end: Phase 4e stores one runtime record per convex mesh piece so the rigid assembly update can move several ConvexPolyhedron particles with one shared center and rotation.
+    walberla::id_t psmMovingBodyUID(0);
 
     if (psmCouplingEnabled) {
         const walberla::AABB & domainAABB = blocks->getDomain();
-        const auto validateSphereCenter = [&](const walberla::Vector3<real_t> & center, const char * description) {
+        const auto validateMovingBodyCenter = [&](const walberla::Vector3<real_t> & center, const char * description) {
             for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
-                WALBERLA_CHECK(center[d] - movingBodyRuntimeConfig.body.radius >= domainAABB.min(d) &&
-                               center[d] + movingBodyRuntimeConfig.body.radius <= domainAABB.max(d),
+                WALBERLA_CHECK(center[d] - movingBodyInteractionRadius >= domainAABB.min(d) &&
+                               center[d] + movingBodyInteractionRadius <= domainAABB.max(d),
                                description)
             }
         };
 
         if (movingBodyRuntimeConfig.body.trajectoryPoints.empty()) {
-            validateSphereCenter(movingBodyRuntimeConfig.body.initialPosition,
-                                 "Phase 3 moving sphere must start fully inside the simulation domain.");
+            validateMovingBodyCenter(movingBodyRuntimeConfig.body.initialPosition,
+                                     "Phase 4 moving body must start fully inside the simulation domain.");
         } else {
             for (const auto & point : movingBodyRuntimeConfig.body.trajectoryPoints) {
-                validateSphereCenter(point.center,
-                                     "Phase 3 moving sphere trajectory points must stay fully inside the simulation domain.");
+                validateMovingBodyCenter(point.center,
+                                         "Phase 4 moving body trajectory points must stay fully inside the simulation domain.");
             }
         }
 
-        psmParticleStorage = std::make_shared<walberla::mesa_pd::data::ParticleStorage>(1);
+        // Reason for edit start: Phase 4e sizes the temporary MesaPD particle storage for either one moving body or one multi-piece convex assembly so the app can keep the earlier single-body cases unchanged.
+        const size_t psmMovingBodyParticleCapacity =
+                movingBodyUsesMeshPieces
+                ? std::max(size_t(1), movingBodyRuntimeConfig.body.convexPieces.size())
+                : size_t(1);
+        psmParticleStorage = std::make_shared<walberla::mesa_pd::data::ParticleStorage>(psmMovingBodyParticleCapacity);
+        // Reason for edit end: Phase 4e sizes the temporary MesaPD particle storage for either one moving body or one multi-piece convex assembly so the app can keep the earlier single-body cases unchanged.
         psmShapeStorage = std::make_shared<walberla::mesa_pd::data::ShapeStorage>();
         psmParticleAccessor = std::make_shared<ParticleAccessor_T>(psmParticleStorage, psmShapeStorage);
 
-        const auto sphereShape =
-                psmShapeStorage->create<walberla::mesa_pd::data::Sphere>(movingBodyRuntimeConfig.body.radius);
-        const MovingSphereState initialMovingSphereState = evaluateMovingSphereState(uint_t(0));
-        const walberla::mesa_pd::Vec3 movingSpherePosition(
-                initialMovingSphereState.center[0],
-                initialMovingSphereState.center[1],
-                initialMovingSphereState.center[2]);
-        const walberla::mesa_pd::Vec3 movingSphereVelocity(
-                initialMovingSphereState.velocity[0],
-                initialMovingSphereState.velocity[1],
-                initialMovingSphereState.velocity[2]);
-        walberla::mesa_pd::data::ParticleStorage::Particle&& movingSphere =
-                *psmParticleStorage->create(true);
-        movingSphere.setPosition(movingSpherePosition);
-        movingSphere.setLinearVelocity(movingSphereVelocity);
-        movingSphere.setInteractionRadius(movingBodyRuntimeConfig.body.radius);
-        movingSphere.setOwner(walberla::mpi::MPIManager::instance()->rank());
-        movingSphere.setShapeID(sphereShape);
-        psmSphereUID = movingSphere.getUid();
+        const MovingBodyState initialMovingBodyState = evaluateMovingBodyState(uint_t(0));
+        // Reason for edit start: Phase 4e centralizes the common MesaPD particle initialization so the new multi-piece convex assembly can reuse the exact same owner, rotation, angular-velocity, and interaction-radius setup as the earlier single-body paths.
+        const auto initializeMovingBodyParticle =
+                [&](walberla::mesa_pd::data::ParticleStorage::Particle & movingBody,
+                    const walberla::id_t movingBodyShape,
+                    const walberla::Vector3<real_t> & particleCenter,
+                    const walberla::Vector3<real_t> & particleVelocity) {
+                    movingBody.setPosition(
+                            walberla::mesa_pd::Vec3(
+                                    particleCenter[0],
+                                    particleCenter[1],
+                                    particleCenter[2]));
+                    movingBody.setLinearVelocity(
+                            walberla::mesa_pd::Vec3(
+                                    particleVelocity[0],
+                                    particleVelocity[1],
+                                    particleVelocity[2]));
+                    movingBody.setRotation(initialMovingBodyState.rotation);
+                    movingBody.setAngularVelocity(
+                            walberla::mesa_pd::Vec3(
+                                    initialMovingBodyState.angularVelocity[0],
+                                    initialMovingBodyState.angularVelocity[1],
+                                    initialMovingBodyState.angularVelocity[2]));
+                    movingBody.setInteractionRadius(movingBodyInteractionRadius);
+                    movingBody.setOwner(walberla::mpi::MPIManager::instance()->rank());
+                    movingBody.setShapeID(movingBodyShape);
+                };
+        // Reason for edit end: Phase 4e centralizes the common MesaPD particle initialization so the new multi-piece convex assembly can reuse the exact same owner, rotation, angular-velocity, and interaction-radius setup as the earlier single-body paths.
+        walberla::id_t movingBodyShape(0);
+        // Reason for edit start: Phase 4c creates one centered octahedron mesh from the existing boxEdgeLength control so a first ConvexPolyhedron body can be mapped without introducing mesh-file input yet.
+#ifdef WALBERLA_MESAPD_CONVEX_POLYHEDRON_AVAILABLE
+        const auto buildPrototypeConvexPolyhedronMesh = [&](const walberla::Vector3<real_t> & edgeLength) {
+            walberla::mesh::TriangleMesh mesh;
+            using Point = walberla::mesh::TriangleMesh::Point;
+            const real_t hx = real_t(0.5) * edgeLength[0];
+            const real_t hy = real_t(0.5) * edgeLength[1];
+            const real_t hz = real_t(0.5) * edgeLength[2];
+
+            const auto vPosX = mesh.add_vertex(Point(hx, real_t(0), real_t(0)));
+            const auto vNegX = mesh.add_vertex(Point(-hx, real_t(0), real_t(0)));
+            const auto vPosY = mesh.add_vertex(Point(real_t(0), hy, real_t(0)));
+            const auto vNegY = mesh.add_vertex(Point(real_t(0), -hy, real_t(0)));
+            const auto vPosZ = mesh.add_vertex(Point(real_t(0), real_t(0), hz));
+            const auto vNegZ = mesh.add_vertex(Point(real_t(0), real_t(0), -hz));
+
+            mesh.add_face(vPosX, vPosY, vPosZ);
+            mesh.add_face(vPosY, vNegX, vPosZ);
+            mesh.add_face(vNegX, vNegY, vPosZ);
+            mesh.add_face(vNegY, vPosX, vPosZ);
+
+            mesh.add_face(vPosY, vPosX, vNegZ);
+            mesh.add_face(vNegX, vPosY, vNegZ);
+            mesh.add_face(vNegY, vNegX, vNegZ);
+            mesh.add_face(vPosX, vNegY, vNegZ);
+
+            return mesh;
+        };
+        // Reason for edit start: Phase 4d loads a user-provided STL/OBJ/OFF mesh, converts its vertex cloud to one convex hull, and fits that hull into the existing boxEdgeLength envelope so file-driven geometry can reuse the current single-convex-body PSM pipeline.
+        const auto buildConvexPolyhedronMeshFromFile =
+                [&](const std::filesystem::path & meshFilePath,
+                    const walberla::Vector3<real_t> & targetExtent) {
+                    walberla::mesh::TriangleMesh rawMesh;
+                    WALBERLA_CHECK(OpenMesh::IO::read_mesh(rawMesh, meshFilePath.string()),
+                                   "Phase 4d could not read moving-body mesh file: " << meshFilePath.string())
+                    WALBERLA_CHECK_GREATER(rawMesh.n_vertices(), size_t(3),
+                                           "Phase 4d requires a moving-body mesh file with at least four vertices.")
+
+                    std::vector<walberla::mesh::TriangleMesh::Point> pointCloud;
+                    pointCloud.reserve(size_t(rawMesh.n_vertices()));
+                    for (const auto vertexHandle : rawMesh.vertices()) {
+                        pointCloud.push_back(rawMesh.point(vertexHandle));
+                    }
+
+                    walberla::mesh::QHull<walberla::mesh::TriangleMesh> qHull(pointCloud);
+                    qHull.run();
+                    walberla::mesh::TriangleMesh convexMesh = qHull.mesh();
+                    WALBERLA_CHECK_GREATER(convexMesh.n_vertices(), size_t(3),
+                                           "Phase 4d convex hull generation produced too few vertices.")
+
+                    const auto convexHullAABB = walberla::mesh::computeAABB(convexMesh);
+                    const walberla::Vector3<real_t> convexHullExtent(
+                            convexHullAABB.xSize(), convexHullAABB.ySize(), convexHullAABB.zSize());
+                    const real_t extentTolerance = real_t(1e-12);
+                    real_t fitScale = std::numeric_limits<real_t>::max();
+                    for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+                        if (convexHullExtent[d] > extentTolerance) {
+                            fitScale = std::min(fitScale, targetExtent[d] / convexHullExtent[d]);
+                        }
+                    }
+
+                    WALBERLA_CHECK(std::isfinite(fitScale) && fitScale > real_t(0),
+                                   "Phase 4d could not compute a positive fit scale for the moving-body mesh file.")
+                    walberla::mesh::scale(convexMesh,
+                                          walberla::Vector3<real_t>(fitScale, fitScale, fitScale));
+
+                    const auto convexHullCentroid = walberla::mesh::computeCentroid(convexMesh);
+                    walberla::mesh::translate(
+                            convexMesh,
+                            walberla::Vector3<real_t>(-convexHullCentroid[0],
+                                                      -convexHullCentroid[1],
+                                                      -convexHullCentroid[2]));
+                    convexMesh.request_face_normals();
+                    convexMesh.update_face_normals();
+
+                    WALBERLA_LOG_INFO_ON_ROOT("Phase 4d loaded moving-body mesh file: "
+                                              << meshFilePath.string()
+                                              << ", raw vertices = " << rawMesh.n_vertices()
+                                              << ", raw faces = " << rawMesh.n_faces()
+                                              << ", convex-hull vertices = " << convexMesh.n_vertices()
+                                              << ", convex-hull faces = " << convexMesh.n_faces()
+                                              << ", fitScale = " << fitScale)
+
+                    return convexMesh;
+                };
+        // Reason for edit end: Phase 4d loads a user-provided STL/OBJ/OFF mesh, converts its vertex cloud to one convex hull, and fits that hull into the existing boxEdgeLength envelope so file-driven geometry can reuse the current single-convex-body PSM pipeline.
+        // Reason for edit start: Phase 4e assembles several convex mesh pieces into one rigid body by convexifying each piece separately, fitting the full assembly into the existing boxEdgeLength envelope, and storing per-piece local offsets for the later kinematic update.
+        struct ConvexAssemblyPiece
+        {
+            walberla::mesh::TriangleMesh mesh{};
+            walberla::Vector3<real_t> localOffset{ real_t(0), real_t(0), real_t(0) };
+            std::string meshLabel{};
+        };
+
+        const auto buildConvexPolyhedronAssemblyPieces =
+                [&](const std::vector<std::filesystem::path> & meshFilePaths,
+                    const std::vector<moving_body::ConvexPieceConfig> & convexPieces,
+                    const walberla::Vector3<real_t> & targetExtent) {
+                    WALBERLA_CHECK_EQUAL(meshFilePaths.size(), convexPieces.size(),
+                                         "Phase 4e expects one resolved mesh path per configured convex piece.")
+
+                    std::vector<walberla::mesh::TriangleMesh> pieceMeshes{};
+                    pieceMeshes.reserve(meshFilePaths.size());
+                    walberla::Vector3<real_t> assemblyMin(
+                            std::numeric_limits<real_t>::max(),
+                            std::numeric_limits<real_t>::max(),
+                            std::numeric_limits<real_t>::max());
+                    walberla::Vector3<real_t> assemblyMax(
+                            std::numeric_limits<real_t>::lowest(),
+                            std::numeric_limits<real_t>::lowest(),
+                            std::numeric_limits<real_t>::lowest());
+
+                    for (size_t pieceIdx = size_t(0); pieceIdx < meshFilePaths.size(); ++pieceIdx) {
+                        walberla::mesh::TriangleMesh rawMesh;
+                        WALBERLA_CHECK(OpenMesh::IO::read_mesh(rawMesh, meshFilePaths[pieceIdx].string()),
+                                       "Phase 4e could not read moving-body mesh piece: " << meshFilePaths[pieceIdx].string())
+                        WALBERLA_CHECK_GREATER(rawMesh.n_vertices(), size_t(3),
+                                               "Phase 4e requires each moving-body mesh piece to contain at least four vertices.")
+
+                        std::vector<walberla::mesh::TriangleMesh::Point> pointCloud;
+                        pointCloud.reserve(size_t(rawMesh.n_vertices()));
+                        for (const auto vertexHandle : rawMesh.vertices()) {
+                            pointCloud.push_back(rawMesh.point(vertexHandle));
+                        }
+
+                        walberla::mesh::QHull<walberla::mesh::TriangleMesh> qHull(pointCloud);
+                        qHull.run();
+                        walberla::mesh::TriangleMesh convexMesh = qHull.mesh();
+                        WALBERLA_CHECK_GREATER(convexMesh.n_vertices(), size_t(3),
+                                               "Phase 4e convex hull generation produced too few vertices for one mesh piece.")
+
+                        walberla::mesh::translate(convexMesh, convexPieces[pieceIdx].offset);
+                        const auto pieceAABB = walberla::mesh::computeAABB(convexMesh);
+                        for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+                            assemblyMin[d] = std::min(assemblyMin[d], pieceAABB.min(d));
+                            assemblyMax[d] = std::max(assemblyMax[d], pieceAABB.max(d));
+                        }
+
+                        WALBERLA_LOG_INFO_ON_ROOT("Phase 4e loaded convex mesh piece " << pieceIdx
+                                                  << ": file = " << meshFilePaths[pieceIdx].string()
+                                                  << ", raw vertices = " << rawMesh.n_vertices()
+                                                  << ", raw faces = " << rawMesh.n_faces()
+                                                  << ", convex-hull vertices = " << convexMesh.n_vertices()
+                                                  << ", convex-hull faces = " << convexMesh.n_faces()
+                                                  << ", prm offset = " << convexPieces[pieceIdx].offset)
+                        pieceMeshes.push_back(convexMesh);
+                    }
+
+                    const walberla::Vector3<real_t> assemblyExtent(
+                            assemblyMax[0] - assemblyMin[0],
+                            assemblyMax[1] - assemblyMin[1],
+                            assemblyMax[2] - assemblyMin[2]);
+                    const real_t extentTolerance = real_t(1e-12);
+                    real_t fitScale = std::numeric_limits<real_t>::max();
+                    for (uint_t d = uint_t(0); d < uint_t(3); ++d) {
+                        if (assemblyExtent[d] > extentTolerance) {
+                            fitScale = std::min(fitScale, targetExtent[d] / assemblyExtent[d]);
+                        }
+                    }
+
+                    WALBERLA_CHECK(std::isfinite(fitScale) && fitScale > real_t(0),
+                                   "Phase 4e could not compute a positive fit scale for the convex-piece assembly.")
+                    // Reason for edit start: Phase 4e keeps the new multi-piece assembly centered by its overall AABB, but preserves the older Phase 4d centroid-centering behavior when only one convex mesh piece is configured so the one-piece migration path stays predictable.
+                    const bool singlePieceAssembly = pieceMeshes.size() == size_t(1);
+                    const walberla::Vector3<real_t> assemblyCenter(
+                            singlePieceAssembly ? real_t(0) : real_t(0.5) * (assemblyMin[0] + assemblyMax[0]) * fitScale,
+                            singlePieceAssembly ? real_t(0) : real_t(0.5) * (assemblyMin[1] + assemblyMax[1]) * fitScale,
+                            singlePieceAssembly ? real_t(0) : real_t(0.5) * (assemblyMin[2] + assemblyMax[2]) * fitScale);
+                    // Reason for edit end: Phase 4e keeps the new multi-piece assembly centered by its overall AABB, but preserves the older Phase 4d centroid-centering behavior when only one convex mesh piece is configured so the one-piece migration path stays predictable.
+
+                    std::vector<ConvexAssemblyPiece> assemblyPieces{};
+                    assemblyPieces.reserve(pieceMeshes.size());
+                    for (size_t pieceIdx = size_t(0); pieceIdx < pieceMeshes.size(); ++pieceIdx) {
+                        walberla::mesh::scale(
+                                pieceMeshes[pieceIdx],
+                                walberla::Vector3<real_t>(fitScale, fitScale, fitScale));
+                        walberla::mesh::translate(pieceMeshes[pieceIdx], -assemblyCenter);
+
+                        const auto pieceCentroid = walberla::mesh::computeCentroid(pieceMeshes[pieceIdx]);
+                        const walberla::Vector3<real_t> pieceCentroidVector(
+                                pieceCentroid[0], pieceCentroid[1], pieceCentroid[2]);
+                        ConvexAssemblyPiece assemblyPiece{};
+                        assemblyPiece.localOffset =
+                                singlePieceAssembly
+                                ? walberla::Vector3<real_t>(real_t(0), real_t(0), real_t(0))
+                                : pieceCentroidVector;
+                        walberla::mesh::translate(
+                                pieceMeshes[pieceIdx],
+                                singlePieceAssembly ? -pieceCentroidVector : -assemblyPiece.localOffset);
+                        pieceMeshes[pieceIdx].request_face_normals();
+                        pieceMeshes[pieceIdx].update_face_normals();
+                        assemblyPiece.mesh = pieceMeshes[pieceIdx];
+                        assemblyPiece.meshLabel = meshFilePaths[pieceIdx].string();
+                        assemblyPieces.push_back(assemblyPiece);
+                    }
+
+                    WALBERLA_LOG_INFO_ON_ROOT("Phase 4e assembled convex mesh pieces: count = "
+                                              << assemblyPieces.size()
+                                              << ", fitScale = " << fitScale
+                                              << ", target boxEdgeLength = " << targetExtent)
+                    return assemblyPieces;
+                };
+        // Reason for edit end: Phase 4e assembles several convex mesh pieces into one rigid body by convexifying each piece separately, fitting the full assembly into the existing boxEdgeLength envelope, and storing per-piece local offsets for the later kinematic update.
+#endif
+        // Reason for edit end: Phase 4c creates one centered octahedron mesh from the existing boxEdgeLength control so a first ConvexPolyhedron body can be mapped without introducing mesh-file input yet.
+        if (movingBodyIsSphere) {
+            movingBodyShape =
+                    psmShapeStorage->create<walberla::mesa_pd::data::Sphere>(movingBodyRuntimeConfig.body.radius);
+            walberla::mesa_pd::data::ParticleStorage::Particle&& movingBody =
+                    *psmParticleStorage->create(true);
+            initializeMovingBodyParticle(
+                    movingBody,
+                    movingBodyShape,
+                    initialMovingBodyState.center,
+                    initialMovingBodyState.velocity);
+            psmMovingBodyUID = movingBody.getUid();
+        } else if (movingBodyIsConvexPolyhedron) {
+#ifdef WALBERLA_MESAPD_CONVEX_POLYHEDRON_AVAILABLE
+            if (movingBodyUsesMeshPieces) {
+                const auto convexAssemblyPieces =
+                        buildConvexPolyhedronAssemblyPieces(
+                                movingBodyPieceMeshFilePaths,
+                                movingBodyRuntimeConfig.body.convexPieces,
+                                movingBodyRuntimeConfig.body.boxEdgeLength);
+                WALBERLA_CHECK(!convexAssemblyPieces.empty(),
+                               "Phase 4e convex-piece assembly creation produced no convex pieces.")
+
+                psmMovingBodyPieces.reserve(convexAssemblyPieces.size());
+                for (size_t pieceIdx = size_t(0); pieceIdx < convexAssemblyPieces.size(); ++pieceIdx) {
+                    const auto pieceKinematics =
+                            evaluateMovingBodyPieceKinematics(
+                                    initialMovingBodyState,
+                                    convexAssemblyPieces[pieceIdx].localOffset);
+                    const walberla::id_t convexPieceShape =
+                            psmShapeStorage->create<walberla::mesa_pd::data::ConvexPolyhedron>(
+                                    convexAssemblyPieces[pieceIdx].mesh);
+                    walberla::mesa_pd::data::ParticleStorage::Particle&& movingBodyPiece =
+                            *psmParticleStorage->create(true);
+                    initializeMovingBodyParticle(
+                            movingBodyPiece,
+                            convexPieceShape,
+                            pieceKinematics.center,
+                            pieceKinematics.velocity);
+                    if (pieceIdx == size_t(0)) {
+                        psmMovingBodyUID = movingBodyPiece.getUid();
+                    }
+                    psmMovingBodyPieces.push_back(
+                            MovingBodyPieceRuntimeState{
+                                    movingBodyPiece.getUid(),
+                                    convexAssemblyPieces[pieceIdx].localOffset,
+                                    convexAssemblyPieces[pieceIdx].meshLabel });
+                }
+            } else {
+                movingBodyShape =
+                        psmShapeStorage->create<walberla::mesa_pd::data::ConvexPolyhedron>(
+                                movingBodyUsesMeshFile
+                                ? buildConvexPolyhedronMeshFromFile(
+                                        movingBodyMeshFilePath,
+                                        movingBodyRuntimeConfig.body.boxEdgeLength)
+                                : buildPrototypeConvexPolyhedronMesh(movingBodyRuntimeConfig.body.boxEdgeLength));
+                walberla::mesa_pd::data::ParticleStorage::Particle&& movingBody =
+                        *psmParticleStorage->create(true);
+                initializeMovingBodyParticle(
+                        movingBody,
+                        movingBodyShape,
+                        initialMovingBodyState.center,
+                        initialMovingBodyState.velocity);
+                psmMovingBodyUID = movingBody.getUid();
+            }
+#else
+            WALBERLA_ABORT("Phase 4c convex-polyhedron moving body requires OpenMesh-backed ConvexPolyhedron support.")
+#endif
+        } else {
+            movingBodyShape =
+                    psmShapeStorage->create<walberla::mesa_pd::data::Box>(
+                            walberla::mesa_pd::Vec3(
+                                    movingBodyRuntimeConfig.body.boxEdgeLength[0],
+                                    movingBodyRuntimeConfig.body.boxEdgeLength[1],
+                                    movingBodyRuntimeConfig.body.boxEdgeLength[2]));
+            walberla::mesa_pd::data::ParticleStorage::Particle&& movingBody =
+                    *psmParticleStorage->create(true);
+            initializeMovingBodyParticle(
+                    movingBody,
+                    movingBodyShape,
+                    initialMovingBodyState.center,
+                    initialMovingBodyState.velocity);
+            psmMovingBodyUID = movingBody.getUid();
+        }
 
         psmParticleAndVolumeFractionSoA =
                 std::make_unique<PSMParticleAndVolumeFractionSoA_T>(blocks, omega);
+        // Reason for edit start: Phase 4c extends the shared PSM collection dispatch so sphere, box, and one convex-polyhedron prototype all flow through the same downstream velocity and force sweeps.
+        const auto particleMappingRepresentation =
+                movingBodyIsConvexPolyhedron
+                ? walberla::lbm_mesapd_coupling::psm::gpu::ParticleMappingRepresentation::convexPolyhedron
+                : (movingBodyIsBoxLike
+                   ? walberla::lbm_mesapd_coupling::psm::gpu::ParticleMappingRepresentation::box
+                   : walberla::lbm_mesapd_coupling::psm::gpu::ParticleMappingRepresentation::sphere);
         psmSweepCollection = std::make_unique<PSMSweepCollection_T>(
                 blocks,
                 psmParticleAccessor,
                 psmGlobalParticleSelector,
                 *psmParticleAndVolumeFractionSoA,
-                walberla::Vector3<uint_t>(uint_t(8), uint_t(8), uint_t(8)));
+                walberla::Vector3<uint_t>(uint_t(8), uint_t(8), uint_t(8)),
+                particleMappingRepresentation,
+                psmMovingBodyUID,
+                movingBodyRuntimeConfig.body.boxEdgeLength);
+        // Reason for edit end: Phase 4c extends the shared PSM collection dispatch so sphere, box, and one convex-polyhedron prototype all flow through the same downstream velocity and force sweeps.
         psmPdfInitializer =
                 std::make_unique<walberla::pystencils::waLBerlaABLPSM_InitializeDomainForPSM>(
                         psmParticleAndVolumeFractionSoA->BsFieldID,
@@ -442,12 +946,36 @@ int main(int argc, char** argv) {
                 velocityFieldGpuID,
                 omega);
 
-        WALBERLA_LOG_INFO_ON_ROOT("Phase 3 kinematic sphere initial state: center = "
-                                  << initialMovingSphereState.center
-                                  << ", velocity = " << initialMovingSphereState.velocity
-                                  << ", radius = " << movingBodyRuntimeConfig.body.radius)
+        WALBERLA_LOG_INFO_ON_ROOT("Phase 4 kinematic moving body initial state: center = "
+                                  << initialMovingBodyState.center
+                                  << ", velocity = " << initialMovingBodyState.velocity
+                                  << ", angularVelocity = " << initialMovingBodyState.angularVelocity)
+        if (movingBodyIsSphere) {
+            WALBERLA_LOG_INFO_ON_ROOT("Phase 4 moving body sphere radius = "
+                                      << movingBodyRuntimeConfig.body.radius)
+        } else if (movingBodyIsConvexPolyhedron) {
+            // Reason for edit start: Phase 4d logs whether the instantiated convex-polyhedron body came from the STL hull or the older prototype so post-run checks can distinguish the geometry source.
+            if (movingBodyUsesMeshPieces) {
+                WALBERLA_LOG_INFO_ON_ROOT("Phase 4e moving body convex-polyhedron assembly pieces = "
+                                          << psmMovingBodyPieces.size()
+                                          << ", assembly fit boxEdgeLength = "
+                                          << movingBodyRuntimeConfig.body.boxEdgeLength)
+            } else if (movingBodyUsesMeshFile) {
+                WALBERLA_LOG_INFO_ON_ROOT("Phase 4 moving body convex-polyhedron mesh file = "
+                                          << movingBodyMeshFilePath.string()
+                                          << ", single-convex-hull fit boxEdgeLength = "
+                                          << movingBodyRuntimeConfig.body.boxEdgeLength)
+            } else {
+                WALBERLA_LOG_INFO_ON_ROOT("Phase 4 moving body convex-polyhedron prototype boxEdgeLength = "
+                                          << movingBodyRuntimeConfig.body.boxEdgeLength)
+            }
+            // Reason for edit end: Phase 4d logs whether the instantiated convex-polyhedron body came from the STL hull or the older prototype so post-run checks can distinguish the geometry source.
+        } else {
+            WALBERLA_LOG_INFO_ON_ROOT("Phase 4 moving body boxEdgeLength = "
+                                      << movingBodyRuntimeConfig.body.boxEdgeLength)
+        }
     }
-    // Reason for edit end: allocate the optional Phase 3 MesaPD and PSM runtime objects beside the existing GPU solver fields so one kinematic sphere can move through the unchanged urban ABL path.
+    // Reason for edit end: allocate the optional Phase 4 MesaPD and PSM runtime objects beside the existing GPU solver fields so one kinematic sphere or box can move and rotate through the unchanged urban ABL path.
 
     WALBERLA_MPI_BARRIER()
     WALBERLA_LOG_INFO_ON_ROOT("Initialisation done")
@@ -481,6 +1009,9 @@ int main(int argc, char** argv) {
     walberla::gpu::ShiftedPeriodicityGPU<PdfGPUField_T> shiftedPeriodicity(blocks, pdfFieldGpuID, fieldGhostLayers,
                                                                            0, 1, periodicShiftValue);
 
+    // Temporary benchmark toggle: comment out the Welford sweep objects/lambdas
+    // instead of removing them, so the current behavior can be restored quickly.
+
     walberla::pystencils::waLBerlaABL_WelfordWFB welfordWFBSweep(
             meanVelocityWfbFieldGpuID, velocityFieldGpuID,
             real_t(0));
@@ -497,6 +1028,8 @@ int main(int argc, char** argv) {
             real_t(0));
         auto welfordOutputLambda = [&welfordOutputSweep](walberla::IBlock * block) { welfordOutputSweep(block); };
 
+    // Temporary benchmark toggle: comment out the Welford sweep objects/lambdas
+    // instead of removing them, so the current behavior can be restored quickly.
     WALBERLA_LOG_INFO_ON_ROOT("Set up communication...")
 
     bool cudaEnabledMPI = parameters.getParameter<bool>("cudaEnabledMPI", false);
@@ -897,42 +1430,87 @@ int main(int argc, char** argv) {
         for(auto & block : *blocks) { topDamping(&block); }
     }
 
-    // Reason for edit start: update the optional Phase 3 kinematic sphere from the prm trajectory before mapping so MesaPD and the PSM sweeps always see the same current particle state.
-    const auto applyMovingSphereState = [&](const uint_t step, const bool logState = false) {
+    // Reason for edit start: update the optional Phase 4 kinematic moving body from the prm translation and angular controls before mapping so MesaPD and the PSM sweeps always see the same current particle state.
+    const auto applyMovingBodyState = [&](const uint_t step, const bool logState = false) {
         if(!psmCouplingEnabled) {
             return;
         }
 
-        const MovingSphereState state = evaluateMovingSphereState(step);
+        const MovingBodyState state = evaluateMovingBodyState(step);
         const walberla::AABB & domainAABB = blocks->getDomain();
         for(uint_t d = uint_t(0); d < uint_t(3); ++d) {
-            WALBERLA_CHECK(state.center[d] - movingBodyRuntimeConfig.body.radius >= domainAABB.min(d) &&
-                           state.center[d] + movingBodyRuntimeConfig.body.radius <= domainAABB.max(d),
-                           "Phase 3 moving sphere left the simulation domain.")
+            WALBERLA_CHECK(state.center[d] - movingBodyInteractionRadius >= domainAABB.min(d) &&
+                           state.center[d] + movingBodyInteractionRadius <= domainAABB.max(d),
+                           "Phase 4 moving body left the simulation domain.")
         }
 
-        const size_t sphereIdx = psmParticleAccessor->uidToIdx(psmSphereUID);
-        WALBERLA_CHECK(sphereIdx != psmParticleAccessor->getInvalidIdx(),
-                       "Phase 3 moving sphere particle could not be found in the MesaPD accessor.")
+        // Reason for edit start: Phase 4e updates either one moving body or one rigid convex-piece assembly from the same kinematic state so later open-mesh-driven multi-piece geometries stay synchronized during prescribed motion.
+        if (!psmMovingBodyPieces.empty()) {
+            for (const auto & movingBodyPiece : psmMovingBodyPieces) {
+                const size_t movingBodyPieceIdx = psmParticleAccessor->uidToIdx(movingBodyPiece.uid);
+                WALBERLA_CHECK(movingBodyPieceIdx != psmParticleAccessor->getInvalidIdx(),
+                               "Phase 4e moving body piece could not be found in the MesaPD accessor.")
 
-        psmParticleAccessor->setPosition(
-                sphereIdx,
-                walberla::mesa_pd::Vec3(state.center[0], state.center[1], state.center[2]));
-        psmParticleAccessor->setLinearVelocity(
-                sphereIdx,
-                walberla::mesa_pd::Vec3(state.velocity[0], state.velocity[1], state.velocity[2]));
+                const auto pieceKinematics =
+                        evaluateMovingBodyPieceKinematics(state, movingBodyPiece.localOffset);
+                psmParticleAccessor->setPosition(
+                        movingBodyPieceIdx,
+                        walberla::mesa_pd::Vec3(
+                                pieceKinematics.center[0],
+                                pieceKinematics.center[1],
+                                pieceKinematics.center[2]));
+                psmParticleAccessor->setLinearVelocity(
+                        movingBodyPieceIdx,
+                        walberla::mesa_pd::Vec3(
+                                pieceKinematics.velocity[0],
+                                pieceKinematics.velocity[1],
+                                pieceKinematics.velocity[2]));
+                psmParticleAccessor->setRotation(
+                        movingBodyPieceIdx,
+                        state.rotation);
+                psmParticleAccessor->setAngularVelocity(
+                        movingBodyPieceIdx,
+                        walberla::mesa_pd::Vec3(
+                                state.angularVelocity[0],
+                                state.angularVelocity[1],
+                                state.angularVelocity[2]));
+            }
+        } else {
+            const size_t movingBodyIdx = psmParticleAccessor->uidToIdx(psmMovingBodyUID);
+            WALBERLA_CHECK(movingBodyIdx != psmParticleAccessor->getInvalidIdx(),
+                           "Phase 4 moving body particle could not be found in the MesaPD accessor.")
+
+            psmParticleAccessor->setPosition(
+                    movingBodyIdx,
+                    walberla::mesa_pd::Vec3(state.center[0], state.center[1], state.center[2]));
+            psmParticleAccessor->setLinearVelocity(
+                    movingBodyIdx,
+                    walberla::mesa_pd::Vec3(state.velocity[0], state.velocity[1], state.velocity[2]));
+            psmParticleAccessor->setRotation(
+                    movingBodyIdx,
+                    state.rotation);
+            psmParticleAccessor->setAngularVelocity(
+                    movingBodyIdx,
+                    walberla::mesa_pd::Vec3(state.angularVelocity[0], state.angularVelocity[1], state.angularVelocity[2]));
+        }
+        // Reason for edit end: Phase 4e updates either one moving body or one rigid convex-piece assembly from the same kinematic state so later open-mesh-driven multi-piece geometries stay synchronized during prescribed motion.
 
         if(logState) {
-            WALBERLA_LOG_INFO_ON_ROOT("Phase 3 moving sphere applied at step " << step
+            WALBERLA_LOG_INFO_ON_ROOT("Phase 4 moving body applied at step " << step
                                       << ": center = " << state.center
-                                      << ", velocity = " << state.velocity)
+                                      << ", velocity = " << state.velocity
+                                      << ", angularVelocity = " << state.angularVelocity)
+            if (!psmMovingBodyPieces.empty()) {
+                WALBERLA_LOG_INFO_ON_ROOT("Phase 4e convex-piece assembly active pieces = "
+                                          << psmMovingBodyPieces.size())
+            }
         }
     };
-    // Reason for edit end: update the optional Phase 3 kinematic sphere from the prm trajectory before mapping so MesaPD and the PSM sweeps always see the same current particle state.
+    // Reason for edit end: update the optional Phase 4 kinematic moving body from the prm translation and angular controls before mapping so MesaPD and the PSM sweeps always see the same current particle state.
 
-    // Reason for edit start: map the Phase 3 kinematic sphere and reinitialize the surrounding PDFs once before the first timestep so the optional PSM path starts from a consistent fluid state.
+    // Reason for edit start: map the Phase 4 kinematic moving body and reinitialize the surrounding PDFs once before the first timestep so the optional PSM path starts from a consistent fluid state.
     if(psmCouplingEnabled) {
-        applyMovingSphereState(uint_t(0), true);
+        applyMovingBodyState(uint_t(0), true);
         for(auto & block : *blocks) {
             psmSweepCollection->particleMappingSweep(&block);
         }
@@ -942,7 +1520,7 @@ int main(int argc, char** argv) {
         }
         cudaDeviceSynchronize();
     }
-    // Reason for edit end: map the Phase 3 kinematic sphere and reinitialize the surrounding PDFs once before the first timestep so the optional PSM path starts from a consistent fluid state.
+    // Reason for edit end: map the Phase 4 kinematic moving body and reinitialize the surrounding PDFs once before the first timestep so the optional PSM path starts from a consistent fluid state.
 
     timeloop.add() << walberla::BeforeFunction(communication->getCommunicateFunctor(), "Field communication")
                    << walberla::BeforeFunction([&boundarySetup, &shiftedPeriodicity]() {
@@ -955,10 +1533,10 @@ int main(int argc, char** argv) {
     }
     // Reason for edit end: run the top-only zero-normal-pressure-gradient sweep immediately after the boundary handling sweep so it becomes the only active top treatment when the generated FreeSlip path has been skipped.
 
-    // Reason for edit start: keep the legacy stream-collide path untouched when PSM is off and swap in the synchronized Phase 3 kinematic-sphere sweep sequence only when the optional coupling is enabled.
+    // Reason for edit start: keep the legacy stream-collide path untouched when PSM is off and swap in the synchronized Phase 4 kinematic moving-body sweep sequence only when the optional coupling is enabled.
     if(psmCouplingEnabled) {
-        const auto updateMovingSphereTrajectory = [&]() {
-            applyMovingSphereState(timeloop.getCurrentTimeStep());
+        const auto updateMovingBodyTrajectory = [&]() {
+            applyMovingBodyState(timeloop.getCurrentTimeStep());
         };
         const std::function<void(walberla::IBlock *)> psmParticleMappingSweep =
                 [&psmSweepCollection](walberla::IBlock * block) { psmSweepCollection->particleMappingSweep(block); };
@@ -968,7 +1546,7 @@ int main(int argc, char** argv) {
         const std::function<void(walberla::IBlock *)> psmReduceParticleForcesSweep =
                 [&psmSweepCollection](walberla::IBlock * block) { psmSweepCollection->reduceParticleForcesSweep(block); };
 
-        timeloop.add() << walberla::BeforeFunction(updateMovingSphereTrajectory, "Update moving sphere trajectory")
+        timeloop.add() << walberla::BeforeFunction(updateMovingBodyTrajectory, "Update moving body trajectory")
                        << walberla::Sweep(
                                 walberla::lbm_mesapd_coupling::psm::gpu::deviceSyncWrapper(psmParticleMappingSweep),
                                 "Particle mapping");
@@ -990,7 +1568,7 @@ int main(int argc, char** argv) {
                        << walberla::AfterFunction(writeVTK, "VTK output")
                        << walberla::AfterFunction(writeLineOutput, "Line output");
     }
-    // Reason for edit end: keep the legacy stream-collide path untouched when PSM is off and swap in the synchronized Phase 3 kinematic-sphere sweep sequence only when the optional coupling is enabled.
+    // Reason for edit end: keep the legacy stream-collide path untouched when PSM is off and swap in the synchronized Phase 4 kinematic moving-body sweep sequence only when the optional coupling is enabled.
 
     // Temporary benchmark toggle: comment out all Welford timeloop registration
     // blocks instead of deleting them, so we can restore the current version later.
@@ -1029,7 +1607,7 @@ int main(int argc, char** argv) {
         timeloop.add() << walberla::Sweep(topDamping.getSweep(), "Top damping");
     }
 
-    // Reason for edit start: reset the per-timestep hydrodynamic force and torque only when the Phase 3 moving sphere is active so future force evaluation stays clean without changing default ABL runs.
+    // Reason for edit start: reset the per-timestep hydrodynamic force and torque only when the Phase 4 moving body is active so future force evaluation stays clean without changing default ABL runs.
     if(psmCouplingEnabled) {
         timeloop.addFuncAfterTimeStep(
                 [psmParticleStorage, psmParticleAccessor]() {
@@ -1042,7 +1620,7 @@ int main(int argc, char** argv) {
                 },
                 "Reset PSM hydrodynamic force");
     }
-    // Reason for edit end: reset the per-timestep hydrodynamic force and torque only when the Phase 3 moving sphere is active so future force evaluation stays clean without changing default ABL runs.
+    // Reason for edit end: reset the per-timestep hydrodynamic force and torque only when the Phase 4 moving body is active so future force evaluation stays clean without changing default ABL runs.
 
     timeloop.addFuncAfterTimeStep(
             walberla::makeSharedFunctor(
